@@ -88,12 +88,45 @@ SUMMARY_PROMPT = dedent(
 
 
 class RagService:
-    """Coordinates embeddings, retrieval, and OpenAI completions."""
+    """Coordinates embeddings, retrieval, and OpenAI/OpenRouter completions."""
 
     def __init__(self, settings: Settings, repository: PatientChunkRepository) -> None:
         self._settings = settings
         self._repo = repository
-        self._client = AsyncOpenAI(api_key=settings.openai_api_key, timeout=settings.openai_timeout_seconds)
+        # self._client = AsyncOpenAI(api_key=settings.openai_api_key, timeout=settings.openai_timeout_seconds)
+                # Use OpenRouter if configured, otherwise use OpenAI
+        if settings.use_openrouter and settings.openrouter_api_key:
+            self._client = AsyncOpenAI(
+                api_key=settings.openrouter_api_key,
+                base_url=settings.openrouter_base_url,
+                timeout=settings.openai_timeout_seconds,
+            )
+        else:
+            self._client = AsyncOpenAI(
+                api_key=settings.openai_api_key,
+                timeout=settings.openai_timeout_seconds
+            )
+        
+        # Embeddings always use OpenAI (OpenRouter doesn't support embeddings)
+        self._embedding_client = AsyncOpenAI(
+            api_key=settings.openai_api_key,
+            timeout=settings.openai_timeout_seconds
+        )
+
+    async def transcribe_audio(self, audio_file_path: str) -> str:
+        """Transcribe audio file using OpenAI Whisper API."""
+        if not audio_file_path:
+            return ""
+        
+        try:
+            with open(audio_file_path, "rb") as audio_file:
+                transcription = await self._client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file
+                )
+            return (transcription.text or "").strip()
+        except Exception as e:
+            return f"[Transcription error: {str(e)}]"
 
     async def generate_patient_summary(
         self, 
@@ -159,6 +192,26 @@ class RagService:
         
         if not chunks:
             chunks = await self._repo.fetch_recent_chunks(patient_id, chunk_limit)
+        
+        # Print retrieved chunks to console
+        print("\n" + "="*80)
+        print(f"QUERY: {question}")
+        print(f"RETRIEVED {len(chunks)} CHUNK(S):")
+        print("="*80)
+        for i, chunk in enumerate(chunks, 1):
+            print(f"\n[Chunk {i}]")
+            print(f"  Document ID: {chunk.document_id}")
+            print(f"  File Name: {chunk.file_name}")
+            if chunk.page_number is not None:
+                print(f"  Page Number: {chunk.page_number}")
+            if chunk.chunk_index is not None:
+                print(f"  Chunk Index: {chunk.chunk_index}")
+            if chunk.text:
+                # Print first 200 characters of the chunk text
+                text_preview = chunk.text[:200] + "..." if len(chunk.text) > 200 else chunk.text
+                print(f"  Text Preview: {text_preview}")
+            print("-" * 80)
+        print("="*80 + "\n")
         
         context = self._format_chunks(chunks)
         
@@ -426,11 +479,19 @@ class RagService:
             # Provide more helpful error messages
             error_msg = str(e)
             if "model" in error_msg.lower() or "not found" in error_msg.lower():
-                raise ValueError(
-                    f"Invalid OpenAI model: {self._settings.openai_model}. "
-                    f"Please check your OPENAI_MODEL setting. "
-                    f"Valid models include: gpt-4o-mini, gpt-4o, gpt-4-turbo, etc."
-                ) from e
+                provider = "OpenRouter" if self._settings.use_openrouter and self._settings.openrouter_api_key else "OpenAI"
+                if provider == "OpenRouter":
+                    raise ValueError(
+                        f"Invalid OpenRouter model: {self._settings.openai_model}. "
+                        f"Please check your model setting. "
+                        f"Valid Gemini models include: google/gemini-2.0-flash-exp, google/gemini-pro, google/gemini-1.5-pro, etc."
+                    ) from e
+                else:
+                    raise ValueError(
+                        f"Invalid OpenAI model: {self._settings.openai_model}. "
+                        f"Please check your OPENAI_MODEL setting. "
+                        f"Valid models include: gpt-4o-mini, gpt-4o, gpt-4-turbo, etc."
+                    ) from e
             raise
         
         # TODO: Log system_context for audit trail
@@ -439,8 +500,9 @@ class RagService:
         return completion.choices[0].message.content or ""
 
     async def _create_embedding(self, text: str) -> list[float]:
+        """Create embeddings using OpenAI (OpenRouter doesn't support embeddings)."""
         try:
-            embedding = await self._client.embeddings.create(
+            embedding = await self._embedding_client.embeddings.create(
                 model=self._settings.openai_embedding_model,
                 input=text,
             )

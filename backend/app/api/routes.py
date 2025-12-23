@@ -3,10 +3,12 @@ API routes consumed by the React frontend.
 """
 
 import json
+import os
+import tempfile
 from typing import AsyncIterator, Literal
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Request, UploadFile, File
 from fastapi.responses import StreamingResponse
 
 from pydantic import BaseModel, Field
@@ -124,4 +126,64 @@ async def post_chat_stream(
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@router.post("/{patient_id}/transcribe", response_model=ChatResponse)
+async def post_transcribe_audio(
+    patient_id: str,
+    audio_file: UploadFile = File(...),
+    rag: RagService = Depends(get_rag_service),
+) -> ChatResponse:
+    """Transcribe audio file using Whisper and return the transcription."""
+    temp_file_path = None
+    try:
+        # Create a temporary file to save the uploaded audio
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as temp_file:
+            # Save uploaded file to temporary location
+            content = await audio_file.read()
+            temp_file.write(content)
+            temp_file_path = temp_file.name
+        
+        # Transcribe the audio
+        transcription = await rag.transcribe_audio(temp_file_path)
+        
+        # Check for transcription errors
+        if transcription.startswith("[Transcription error"):
+            from app.core.errors import APIException
+            raise APIException(
+                message="Failed to transcribe audio. Please try recording again.",
+                details={"error": transcription}
+            )
+        
+        if not transcription.strip():
+            from app.core.errors import APIException
+            raise APIException(
+                message="No speech detected in the audio. Please try again.",
+                details={}
+            )
+        
+        return ChatResponse(message=transcription)
+    except Exception as e:
+        # Log the error
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(f"Error transcribing audio for patient {patient_id}: {str(e)}", exc_info=True)
+        
+        # If it's already an APIException, re-raise it
+        from app.core.errors import APIException
+        if isinstance(e, APIException):
+            raise
+        
+        # Otherwise, wrap it in an APIException
+        raise APIException(
+            message=f"Failed to transcribe audio: {str(e)}",
+            details={"patient_id": patient_id}
+        )
+    finally:
+        # Clean up temporary file
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.unlink(temp_file_path)
+            except Exception:
+                pass  # Ignore cleanup errors
 
