@@ -14,6 +14,7 @@ from app.api.routes import router as patient_router
 from app.core.config import get_settings
 from app.core.errors import APIException
 from app.repositories.patient_chunks import PatientChunkRepository
+from app.repositories.rag_log import RagLogRepository
 from app.services.rag import RagService
 
 settings = get_settings()
@@ -29,13 +30,25 @@ async def lifespan(app: FastAPI):
         min_size=settings.pg_pool_min_size,
         max_size=settings.pg_pool_max_size,
     )
-    app.state.rag_service = RagService(settings, app.state.chunk_repo)
+    app.state.log_repo = await RagLogRepository.create(
+        settings.database_url,
+        min_size=settings.pg_pool_min_size,
+        max_size=settings.pg_pool_max_size,
+    )
+    app.state.rag_service = RagService(settings, app.state.chunk_repo, app.state.log_repo)
+    
+    # Log that logging is initialized
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info("RAG logging initialized and ready")
     
     yield  # App runs here
     
     # Shutdown
     if hasattr(app.state, "chunk_repo"):
         await app.state.chunk_repo.close()
+    if hasattr(app.state, "log_repo"):
+        await app.state.log_repo.close()
 
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)

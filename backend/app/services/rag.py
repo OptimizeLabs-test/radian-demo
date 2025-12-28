@@ -5,8 +5,11 @@ Retrieval augmented generation service using OpenAI + Supabase.
 from __future__ import annotations
 
 import asyncio
+import logging
+import re
+import time
 from textwrap import dedent
-from typing import Iterable, Literal
+from typing import AsyncIterator, Iterable, Literal
 from datetime import datetime
 
 from openai import AsyncOpenAI
@@ -14,6 +17,7 @@ from openai import AsyncOpenAI
 from app.core.config import Settings
 from app.models.schemas import ChatMessage, PatientSummary, SpecialtyPerspective, SystemContext
 from app.repositories.patient_chunks import PatientChunk, PatientChunkRepository
+from app.repositories.rag_log import RagLogRepository
 
 SYSTEM_PROMPT = dedent(
     """
@@ -27,17 +31,26 @@ SYSTEM_PROMPT = dedent(
     - Comment on medication adherence or continuity when documented
     - Identify areas that may warrant closer review or follow-up (without clinical judgment)
     
+    CRITICAL: Data Extraction Requirements:
+    - Read through ALL provided document chunks thoroughly and completely
+    - Extract ALL numerical values, dates, lab results, measurements, and test values from the context
+    - Values may appear in various formats: tables, lists, paragraphs, or structured data
+    - When searching for specific dates, be flexible with date formats (e.g., "Nov 21, 2025", "2025-11-21", "November 21, 2025", "11/21/2025")
+    - Do NOT state that data is missing until you have carefully examined every chunk for the requested information
+    - Report ALL matching values found, not just the first one encountered
+    
     Strict constraints:
     - Do NOT make diagnoses, differential diagnoses, or treatment recommendations
     - Do NOT use language implying clinical conclusions (e.g., "suggestive of", "indicates", "likely")
-    - Do NOT infer missing data
+    - Do NOT infer missing data - but DO thoroughly extract all data that exists in the context
     
-    If information is incomplete or unavailable:
+    If information is incomplete or unavailable AFTER thorough examination:
     - Explicitly state what data is missing
     - Explain how that limits interpretation
     
     When referencing data:
     - Anchor statements to timeframes (e.g., "over the last 3 months", "most recent value on <date>")
+    - Include exact values, dates, and units when available
     - Prefer objective sources in this order when available:
     1. Vitals and labs
     2. Medication records
@@ -81,18 +94,14 @@ SUMMARY_PROMPT = dedent(
 ).strip()
 
 
-# SPECIALTY_PROMPT_TEMPLATE = (
-#     "You are a {specialty} specialist. Highlight 3 focused observations or monitoring "
-#     "considerations related to your specialty. Avoid diagnoses."
-# )
-
 
 class RagService:
     """Coordinates embeddings, retrieval, and OpenAI/OpenRouter completions."""
 
-    def __init__(self, settings: Settings, repository: PatientChunkRepository) -> None:
+    def __init__(self, settings: Settings, repository: PatientChunkRepository, log_repository: RagLogRepository | None = None) -> None:
         self._settings = settings
         self._repo = repository
+        self._log_repo = log_repository
         # self._client = AsyncOpenAI(api_key=settings.openai_api_key, timeout=settings.openai_timeout_seconds)
                 # Use OpenRouter if configured, otherwise use OpenAI
         if settings.use_openrouter and settings.openrouter_api_key:
@@ -119,13 +128,18 @@ class RagService:
             return ""
         
         try:
+            # Whisper API only works with OpenAI, not OpenRouter
+            # Use embedding_client which is always OpenAI
             with open(audio_file_path, "rb") as audio_file:
-                transcription = await self._client.audio.transcriptions.create(
+                transcription = await self._embedding_client.audio.transcriptions.create(
                     model="whisper-1",
                     file=audio_file
                 )
             return (transcription.text or "").strip()
         except Exception as e:
+            # Log the actual error for debugging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Whisper transcription error: {str(e)}", exc_info=True)
             return f"[Transcription error: {str(e)}]"
 
     async def generate_patient_summary(
@@ -133,8 +147,8 @@ class RagService:
         patient_id: str, 
         system_context: SystemContext
     ) -> PatientSummary:
-        # Use fewer chunks for summary to speed up processing (8 instead of 12)
-        chunk_limit = min(8, self._settings.max_retrieval_chunks)
+        # Use configurable chunk limit for summaries
+        chunk_limit = self._settings.max_retrieval_chunks_summary
         chunks = await self._repo.fetch_recent_chunks(patient_id, chunk_limit)
         context = self._format_chunks(chunks)
         
@@ -147,19 +161,6 @@ class RagService:
         # Hardcoded intro message - return immediately without any async operations
         return "Hello, Doctor. What would you like to know today?"
 
-    # async def generate_specialty_perspectives(self, patient_id: str) -> list[SpecialtyPerspective]:
-        # chunks = await self._repo.fetch_recent_chunks(patient_id, self._settings.max_retrieval_chunks)
-        # context = self._format_chunks(chunks)
-
-        # async def run_agent(specialty: str) -> SpecialtyPerspective:
-            # prompt = SPECIALTY_PROMPT_TEMPLATE.format(specialty=specialty)
-            # content = await self._chat_completion(prompt=prompt, context=context)
-            # insights = [line.strip("-• ").strip() for line in content.splitlines() if line.strip()]
-            # insights = [i for i in insights if i]
-            # return SpecialtyPerspective(specialty=specialty, insights=insights[:5])
-
-        # results = await asyncio.gather(*(run_agent(name) for name in self._settings.specialty_agents))
-        # return list(results)
     async def generate_specialty_perspectives(self, patient_id: str) -> list[SpecialtyPerspective]:
         return [
             SpecialtyPerspective(
@@ -168,20 +169,79 @@ class RagService:
             )
         ]
 
+    def _extract_lab_keywords(self, question: str) -> list[str]:
+        """
+        Extract lab/test keywords from the question for hybrid search.
+        Looks for common lab names and test terms.
+        """
+        question_lower = question.lower()
+        keywords = []
+        
+        # Common lab names and terms to search for
+        lab_patterns = [
+            r'\btriglyceride[s]?\b',
+            r'\bcholesterol\b',
+            r'\bglucose\b',
+            r'\bhba1c\b',
+            r'\bcreatinine\b',
+            r'\bhemoglobin\b',
+            r'\bplatelet[s]?\b',
+            r'\bwbc\b',
+            r'\brbc\b',
+            r'\blipid[s]?\b',
+            r'\bldl\b',
+            r'\bhdl\b',
+            r'\bbp\b',
+            r'\bblood pressure\b',
+            r'\bbmi\b',
+            r'\bweight\b',
+            r'\bheight\b',
+        ]
+        
+        for pattern in lab_patterns:
+            match = re.search(pattern, question_lower)
+            if match:
+                keyword = match.group(0).strip()
+                # Handle plural/singular - add both forms for better matching
+                if keyword.endswith('s') and len(keyword) > 3:
+                    keywords.append(keyword[:-1])  # Add singular form
+                keywords.append(keyword)
+        
+        return list(set(keywords))  # Remove duplicates
+    
+    def _needs_hybrid_search(self, question: str) -> bool:
+        """
+        Determine if a query would benefit from hybrid search.
+        Queries asking for multiple results or "all" results need hybrid search.
+        """
+        question_lower = question.lower()
+        patterns = [
+            r'\blast\s+\d+',  # "last 5", "last 10"
+            r'\b(all|every|each)\s+',  # "all results", "every test"
+            r'\bhow many',  # "how many results"
+            r'\blist\s+',  # "list all"
+        ]
+        return any(re.search(pattern, question_lower) for pattern in patterns)
+
     async def answer_question(
         self, 
         patient_id: str, 
         question: str, 
         history: list[ChatMessage],
-        system_context: SystemContext
+        system_context: SystemContext,
+        session_id: str | None = None,
     ) -> str:
         """Answer a physician's question using RAG."""
-        # Use fewer chunks for faster retrieval
-        chunk_limit = min(6, self._settings.max_retrieval_chunks)
+        # Start timing for latency measurement
+        start_time = time.perf_counter()
+        
+        # Use configurable chunk limit for chat queries
+        chunk_limit = self._settings.max_retrieval_chunks_chat
         
         # Create embedding and search in parallel if possible, but embedding is required first
         embedding = await self._create_embedding(question)
         
+        # Start with semantic search
         chunks = await self._repo.search_similar_chunks(
             patient_id,
             embedding,
@@ -190,28 +250,68 @@ class RagService:
             ivfflat_probes=self._settings.ivfflat_probes,
         )
         
+        # For queries asking for multiple results, supplement with keyword search
+        if self._needs_hybrid_search(question):
+            lab_keywords = self._extract_lab_keywords(question)
+            if lab_keywords:
+                # Use the most relevant keyword (usually the first/longest one)
+                primary_keyword = max(lab_keywords, key=len)
+                # Retrieve more chunks via keyword search (2x limit for comprehensive coverage)
+                keyword_chunks = await self._repo.search_chunks_by_keyword(
+                    patient_id,
+                    primary_keyword,
+                    chunk_limit * 2,  # Get more chunks from keyword search
+                )
+                
+                # Combine and deduplicate by chunk_id
+                chunk_ids_seen = {chunk.chunk_id for chunk in chunks}
+                for chunk in keyword_chunks:
+                    if chunk.chunk_id not in chunk_ids_seen:
+                        chunks.append(chunk)
+                        chunk_ids_seen.add(chunk.chunk_id)
+                
+                # Also fetch related chunks from the same documents that contain the keyword
+                # This helps when dates/headers are in one chunk and values in another
+                document_ids = list(set(chunk.document_id for chunk in keyword_chunks))
+                if document_ids:
+                    related_chunks = await self._repo.fetch_chunks_by_documents(
+                        patient_id,
+                        document_ids,
+                        limit_per_document=5,  # Get up to 5 chunks per document
+                    )
+                    
+                    # Add related chunks that aren't already included
+                    for chunk in related_chunks:
+                        if chunk.chunk_id not in chunk_ids_seen:
+                            chunks.append(chunk)
+                            chunk_ids_seen.add(chunk.chunk_id)
+                
+                # Limit total chunks to avoid context overflow (but allow more for comprehensive queries)
+                if len(chunks) > chunk_limit * 3:
+                    chunks = chunks[:chunk_limit * 3]
+        
         if not chunks:
             chunks = await self._repo.fetch_recent_chunks(patient_id, chunk_limit)
         
         # Print retrieved chunks to console
-        print("\n" + "="*80)
-        print(f"QUERY: {question}")
-        print(f"RETRIEVED {len(chunks)} CHUNK(S):")
-        print("="*80)
-        for i, chunk in enumerate(chunks, 1):
-            print(f"\n[Chunk {i}]")
-            print(f"  Document ID: {chunk.document_id}")
-            print(f"  File Name: {chunk.file_name}")
-            if chunk.page_number is not None:
-                print(f"  Page Number: {chunk.page_number}")
-            if chunk.chunk_index is not None:
-                print(f"  Chunk Index: {chunk.chunk_index}")
-            if chunk.text:
-                # Print first 200 characters of the chunk text
-                text_preview = chunk.text[:200] + "..." if len(chunk.text) > 200 else chunk.text
-                print(f"  Text Preview: {text_preview}")
-            print("-" * 80)
-        print("="*80 + "\n")
+        # print("\n" + "="*80)
+        # print(f"QUERY: {question}")
+        # print(f"RETRIEVED {len(chunks)} CHUNK(S):")
+        # print("="*80)
+        # for i, chunk in enumerate(chunks, 1):
+        #     print(f"\n[Chunk {i}]")
+        #     print(f"  Document ID: {chunk.document_id}")
+        #     print(f"  File Name: {chunk.file_name}")
+        #     if chunk.page_number is not None:
+        #         print(f"  Page Number: {chunk.page_number}")
+        #     if chunk.chunk_index is not None:
+        #         print(f"  Chunk Index: {chunk.chunk_index}")
+        #     if chunk.text:
+        #         # Print first 200 characters of the chunk text
+        #         text_preview = chunk.text[:200] + "..." if len(chunk.text) > 200 else chunk.text
+        #         print(f"  Text Preview: {text_preview}")
+        #     print("-" * 80)
+        # print("="*80 + "\n")
         
         context = self._format_chunks(chunks)
         
@@ -226,6 +326,37 @@ class RagService:
             history=history,
             system_context=system_context,
         )
+        
+        # Calculate latency (time taken to process the query)
+        latency = time.perf_counter() - start_time
+        
+        # Log the RAG query if logging is enabled
+        logger = logging.getLogger(__name__)
+        if not self._log_repo:
+            logger.warning("RAG log repository not initialized - skipping logging")
+        else:
+            # Generate session_id if not provided (fallback for logging)
+            if not session_id:
+                import uuid
+                session_id = f"auto-{uuid.uuid4().hex[:12]}"
+                logger.info(f"Generated session_id for logging: {session_id}")
+            
+            try:
+                logger.info(f"Logging RAG query: session_id={session_id}, patient_id={patient_id}, latency={latency:.2f}s")
+                chunks_for_log = self._format_chunks_for_logging(chunks)
+                await self._log_repo.log_rag_query(
+                    session_id=session_id,
+                    patient_id=patient_id,
+                    user_query=question,
+                    response=message,
+                    chunks_extracted=chunks_for_log,
+                    latency=latency,
+                )
+                logger.info(f"Successfully logged RAG query for session {session_id}")
+            except Exception as e:
+                # Don't fail the request if logging fails
+                logger.error(f"Failed to log RAG query: {str(e)}", exc_info=True)
+        
         return message
 
     def _get_chat_prompt(self, question: str) -> str:
@@ -233,114 +364,139 @@ class RagService:
         question_lower = question.lower()
         
         # Check for summary requests
-        if any(keyword in question_lower for keyword in ["summarize", "summary", "6 months", "medical history"]):
-            return dedent(
-                """
-                Answer the physician's question using the patient context provided.
-                Extract specific information, values, trends, or observations from the context.
+        # if any(keyword in question_lower for keyword in ["summarize", "summary", "6 months", "medical history"]):
+        #     return dedent(
+        #         """
+        #         Answer the physician's question using the patient context provided.
+        #         Extract specific information, values, trends, or observations from the context.
                 
-                FORMAT YOUR RESPONSE AS FOLLOWS:
+        #         FORMAT YOUR RESPONSE AS FOLLOWS:
                 
-                🏥 [Title with Emoji] - [Brief descriptive title]
+        #         🏥 [Title with Emoji] - [Brief descriptive title]
                 
-                [Section Header]:
+        #         [Section Header]:
                 
-                [Content organized into clear sections with structured bullet points]
-                - Each bullet point should be a concise, informative line
-                - Include specific dates, values, and timeframes when available
-                - Group related medical conditions or events together
-                - Use clear, clinical language
+        #         [Content organized into clear sections with structured bullet points]
+        #         - Each bullet point should be a concise, informative line
+        #         - Include specific dates, values, and timeframes when available
+        #         - Group related medical conditions or events together
+        #         - Use clear, clinical language
                 
-                Example format:
-                🏥 Summary of Last 6 Months & Top 3 Active Problems
+        #         Example format:
+        #         🏥 Summary of Last 6 Months & Top 3 Active Problems
                 
-                Six-Month Medical History Synopsis:
+        #         Six-Month Medical History Synopsis:
                 
-                - [Condition/Event]: [Description with dates and details]
-                - [Condition/Event]: [Description with dates and details]
+        #         - [Condition/Event]: [Description with dates and details]
+        #         - [Condition/Event]: [Description with dates and details]
                 
-                If the information is not in the context, state that clearly.
-                Provide factual, concise answers based on the medical records.
-                """
-            ).strip()
+        #         If the information is not in the context, state that clearly.
+        #         Provide factual, concise answers based on the medical records.
+        #         """
+        #     ).strip()
         
-        # Check for IFE readings or lab data requests
-        if any(keyword in question_lower for keyword in ["ife", "readings", "lab", "table", "trend"]):
-            return dedent(
-                """
-                Answer the physician's question using the patient context provided.
-                Extract specific information, values, trends, or observations from the context.
+        # # Check for IFE readings or lab data requests
+        # if any(keyword in question_lower for keyword in ["ife", "readings", "lab", "table", "trend"]):
+        #     return dedent(
+        #         """
+        #         Answer the physician's question using the patient context provided.
+        #         Extract specific information, values, trends, or observations from the context.
                 
-                FORMAT YOUR RESPONSE AS FOLLOWS:
+        #         FORMAT YOUR RESPONSE AS FOLLOWS:
                 
-                📊 [Title with Emoji] - [Brief descriptive title]
+        #         📊 [Title with Emoji] - [Brief descriptive title]
                 
-                Present the data in a MARKDOWN TABLE format. Use appropriate column headers based on the data type.
+        #         Present the data in a MARKDOWN TABLE format. Use appropriate column headers based on the data type.
                 
-                Example format for IFE readings:
-                | Date | Kappa (mg/L) | Lambda (mg/L) | Ratio | Summary |
-                |------|--------------|---------------|------|---------|
-                | [Date] | [Value] | [Value] | [Value] | [Brief description] |
+        #         Example format for IFE readings:
+        #         | Date | Kappa (mg/L) | Lambda (mg/L) | Ratio | Summary |
+        #         |------|--------------|---------------|------|---------|
+        #         | [Date] | [Value] | [Value] | [Value] | [Brief description] |
                 
-                Include an "Overall trend" summary paragraph below the table describing the pattern or trend observed.
+        #         Include an "Overall trend" summary paragraph below the table describing the pattern or trend observed.
                 
-                If the information is not in the context, state that clearly.
-                Provide factual, concise answers based on the medical records.
-                """
-            ).strip()
+        #         If the information is not in the context, state that clearly.
+        #         Provide factual, concise answers based on the medical records.
+        #         """
+        #     ).strip()
         
-        # Check for risk score or calculation requests
-        if any(keyword in question_lower for keyword in ["risk", "score", "calculate", "decompensation", "instability"]):
-            return dedent(
-                """
-                Answer the physician's question using the patient context provided.
-                Extract specific information, values, trends, or observations from the context.
+        # # Check for risk score or calculation requests
+        # if any(keyword in question_lower for keyword in ["risk", "score", "calculate", "decompensation", "instability"]):
+        #     return dedent(
+        #         """
+        #         Answer the physician's question using the patient context provided.
+        #         Extract specific information, values, trends, or observations from the context.
                 
-                FORMAT YOUR RESPONSE AS FOLLOWS:
+        #         FORMAT YOUR RESPONSE AS FOLLOWS:
                 
-                ⚠️ [Title with Emoji] - [Score Name]: [Numeric Value] (on a [scale description], e.g., "0-1 scale").
+        #         ⚠️ [Title with Emoji] - [Score Name]: [Numeric Value] (on a [scale description], e.g., "0-1 scale").
                 
-                Top Contributing Clinical Variables:
+        #         Top Contributing Clinical Variables:
                 
-                [Category Name]: [Description of findings and their contribution to risk]
-                [Category Name]: [Description of findings and their contribution to risk]
-                [Category Name]: [Description of findings and their contribution to risk]
+        #         [Category Name]: [Description of findings and their contribution to risk]
+        #         [Category Name]: [Description of findings and their contribution to risk]
+        #         [Category Name]: [Description of findings and their contribution to risk]
                 
-                Group variables by category (Vitals, Labs, Medications, etc.).
-                Include specific values, trends, and observations when available.
-                Explain how each category contributes to the overall risk assessment.
+        #         Group variables by category (Vitals, Labs, Medications, etc.).
+        #         Include specific values, trends, and observations when available.
+        #         Explain how each category contributes to the overall risk assessment.
                 
-                Example format:
-                ⚠️ Instability Score: 0.62 (on a 0–1 scale).
+        #         Example format:
+        #         ⚠️ Instability Score: 0.62 (on a 0–1 scale).
                 
-                Top Contributing Clinical Variables:
+        #         Top Contributing Clinical Variables:
                 
-                Vitals: [Description]
-                Labs: [Description]
-                Medications: [Description]
+        #         Vitals: [Description]
+        #         Labs: [Description]
+        #         Medications: [Description]
                 
-                If the information is not in the context, state that clearly.
-                Provide factual, concise answers based on the medical records.
-                """
-            ).strip()
+        #         If the information is not in the context, state that clearly.
+        #         Provide factual, concise answers based on the medical records.
+        #         """
+        #     ).strip()
         
         # Default formatting for other questions
+        # return dedent(
+        #     """
+        #     Answer the physician's question using the patient context provided.
+        #     Extract specific information, values, trends, or observations from the context.
+            
+        #     FORMAT YOUR RESPONSE AS FOLLOWS:
+            
+        #     [Use an appropriate emoji] [Title] - [Brief descriptive title]
+            
+        #     [Organize your answer into clear sections with headers if needed]
+        #     - Use bullet points for lists
+        #     - Use tables for structured data
+        #     - Include specific dates, values, and timeframes when available
+            
+        #     If the information is not in the context, state that clearly.
+        #     Provide factual, concise answers based on the medical records.
+        #     """
+        # ).strip()
         return dedent(
             """
             Answer the physician's question using the patient context provided.
-            Extract specific information, values, trends, or observations from the context.
             
-            FORMAT YOUR RESPONSE AS FOLLOWS:
+            CRITICAL INSTRUCTIONS FOR DATA EXTRACTION:
+            - Carefully read through ALL provided document chunks completely and thoroughly
+            - Extract ALL numerical values, dates, lab results, and measurements from the context
+            - Look for values even if they appear in tables, lists, paragraphs, or various formats
+            - Values may appear in different chunks than their associated dates - search across ALL chunks
+            - When a date is mentioned, search ALL chunks for the corresponding numerical value, even if it's not in the same chunk as the date
+            - When searching for specific dates, check all date formats (e.g., "Nov 21, 2025", "2025-11-21", "November 21, 2025", "11/21/2025", "Sep 25", "September 25")
+            - Do NOT assume data is missing - thoroughly examine every chunk before concluding information is unavailable
+            - If multiple values exist for the same metric, extract and report ALL of them, sorted by date (most recent first)
+            - For queries asking for "last N results", find ALL matching values across all chunks and sort them by date
             
-            [Use an appropriate emoji] [Title] - [Brief descriptive title]
+            IMPORTANT: When chunks contain dates but no values, the values may be in adjacent chunks from the same document. 
+            Always check all chunks from documents that contain relevant dates or keywords.
             
-            [Organize your answer into clear sections with headers if needed]
-            - Use bullet points for lists
-            - Use tables for structured data
-            - Include specific dates, values, and timeframes when available
-            
-            If the information is not in the context, state that clearly.
             Provide factual, concise answers based on the medical records.
+            Include specific values, dates, and measurements when available in the context.
+            If the information is truly not in the context after thorough examination, state that clearly.
+            Use clear, clinical language.
+            Be concise, factual, and neutral.
             """
         ).strip()
 
@@ -466,7 +622,7 @@ class RagService:
         # Determine max_tokens based on whether this is a chat response (needs more tokens for formatting)
         # or summary (can be shorter)
         is_chat_response = question is not None or history is not None
-        max_tokens = 800 if is_chat_response else 400  # More tokens for formatted chat responses
+        max_tokens = 1500 if is_chat_response else 400  # Increased from 800 to 1500 for more detailed chat responses
         
         try:
             completion = await self._client.chat.completions.create(
@@ -499,6 +655,221 @@ class RagService:
         
         return completion.choices[0].message.content or ""
 
+    async def _chat_completion_stream(
+        self,
+        *,
+        prompt: str,
+        context: str,
+        question: str | None = None,
+        history: list[ChatMessage] | None = None,
+        system_context: SystemContext,
+    ) -> AsyncIterator[str]:
+        """Execute a streaming OpenAI ChatCompletion call."""
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        
+        # Add system context as hidden metadata in system message
+        context_metadata = (
+            f"\n[System Context: mode={system_context.context_mode}, "
+            f"scope={system_context.patient_scope}, "
+            f"reference_time={system_context.reference_time}]"
+        )
+        
+        if context and context != "No patient context available.":
+            messages.append({
+                "role": "system", 
+                "content": f"Patient Context:\n{context}{context_metadata}"
+            })
+        
+        messages.append({"role": "system", "content": prompt})
+        
+        if history:
+            for item in history:
+                messages.append({"role": item.role, "content": item.content})
+        
+        if question:
+            messages.append({"role": "user", "content": question})
+
+        # Determine max_tokens based on whether this is a chat response (needs more tokens for formatting)
+        # or summary (can be shorter)
+        is_chat_response = question is not None or history is not None
+        max_tokens = 1500 if is_chat_response else 400
+        
+        try:
+            stream = await self._client.chat.completions.create(
+                model=self._settings.openai_model,
+                temperature=0.2,
+                max_tokens=max_tokens,
+                messages=messages,  # type: ignore[arg-type]
+                stream=True,
+            )
+            
+            async for chunk in stream:
+                if chunk.choices and len(chunk.choices) > 0:
+                    delta = chunk.choices[0].delta
+                    if delta.content:
+                        yield delta.content
+        except Exception as e:
+            # Provide more helpful error messages
+            error_msg = str(e)
+            if "model" in error_msg.lower() or "not found" in error_msg.lower():
+                provider = "OpenRouter" if self._settings.use_openrouter and self._settings.openrouter_api_key else "OpenAI"
+                if provider == "OpenRouter":
+                    raise ValueError(
+                        f"Invalid OpenRouter model: {self._settings.openai_model}. "
+                        f"Please check your model setting. "
+                        f"Valid Gemini models include: google/gemini-2.0-flash-exp, google/gemini-pro, google/gemini-1.5-pro, etc."
+                    ) from e
+                else:
+                    raise ValueError(
+                        f"Invalid OpenAI model: {self._settings.openai_model}. "
+                        f"Please check your OPENAI_MODEL setting. "
+                        f"Valid models include: gpt-4o-mini, gpt-4o, gpt-4-turbo, etc."
+                    ) from e
+            raise
+
+    async def generate_patient_summary_stream(
+        self, 
+        patient_id: str, 
+        system_context: SystemContext
+    ) -> AsyncIterator[str]:
+        """Stream patient summary as it's generated."""
+        # Use configurable chunk limit for summaries
+        chunk_limit = self._settings.max_retrieval_chunks_summary
+        chunks = await self._repo.fetch_recent_chunks(patient_id, chunk_limit)
+        context = self._format_chunks(chunks)
+        
+        # Enhance prompt with reference_time
+        enhanced_prompt = self._add_temporal_context(SUMMARY_PROMPT, system_context)
+        question = dedent(
+            f"""
+            Instructions: {enhanced_prompt}
+            Provide the response in the following format:
+            HEADLINE: Overall Status: <status summary>
+            BULLETS:
+            - <bullet point one>
+            - <bullet point two>
+            - <bullet point three>
+            """
+        )
+        
+        async for chunk in self._chat_completion_stream(
+            prompt=question,
+            context=context,
+            system_context=system_context
+        ):
+            yield chunk
+
+    async def answer_question_stream(
+        self, 
+        patient_id: str, 
+        question: str, 
+        history: list[ChatMessage],
+        system_context: SystemContext,
+        session_id: str | None = None,
+    ) -> AsyncIterator[str]:
+        """Stream answer to a physician's question using RAG."""
+        # Start timing for latency measurement
+        start_time = time.perf_counter()
+        
+        # Use configurable chunk limit for chat queries
+        chunk_limit = self._settings.max_retrieval_chunks_chat
+        
+        # Create embedding and search
+        embedding = await self._create_embedding(question)
+        
+        # Start with semantic search
+        chunks = await self._repo.search_similar_chunks(
+            patient_id,
+            embedding,
+            chunk_limit,
+            min_similarity=self._settings.min_similarity_score_chat,
+            ivfflat_probes=self._settings.ivfflat_probes,
+        )
+        
+        # For queries asking for multiple results, supplement with keyword search
+        if self._needs_hybrid_search(question):
+            lab_keywords = self._extract_lab_keywords(question)
+            if lab_keywords:
+                primary_keyword = max(lab_keywords, key=len)
+                keyword_chunks = await self._repo.search_chunks_by_keyword(
+                    patient_id,
+                    primary_keyword,
+                    chunk_limit * 2,
+                )
+                
+                chunk_ids_seen = {chunk.chunk_id for chunk in chunks}
+                for chunk in keyword_chunks:
+                    if chunk.chunk_id not in chunk_ids_seen:
+                        chunks.append(chunk)
+                        chunk_ids_seen.add(chunk.chunk_id)
+                
+                document_ids = list(set(chunk.document_id for chunk in keyword_chunks))
+                if document_ids:
+                    related_chunks = await self._repo.fetch_chunks_by_documents(
+                        patient_id,
+                        document_ids,
+                        limit_per_document=5,
+                    )
+                    
+                    for chunk in related_chunks:
+                        if chunk.chunk_id not in chunk_ids_seen:
+                            chunks.append(chunk)
+                            chunk_ids_seen.add(chunk.chunk_id)
+                
+                if len(chunks) > chunk_limit * 3:
+                    chunks = chunks[:chunk_limit * 3]
+        
+        if not chunks:
+            chunks = await self._repo.fetch_recent_chunks(patient_id, chunk_limit)
+        
+        context = self._format_chunks(chunks)
+        
+        # Enhance chat prompt with temporal context and formatting instructions
+        chat_prompt = self._get_chat_prompt(question)
+        enhanced_prompt = self._add_temporal_context(chat_prompt, system_context)
+        
+        # Stream the response and collect it for logging
+        full_response = ""
+        async for chunk in self._chat_completion_stream(
+            prompt=enhanced_prompt,
+            context=context,
+            question=question,
+            history=history,
+            system_context=system_context,
+        ):
+            full_response += chunk
+            yield chunk
+        
+        # Calculate latency and log after streaming completes
+        latency = time.perf_counter() - start_time
+        
+        # Log the RAG query if logging is enabled
+        logger = logging.getLogger(__name__)
+        if not self._log_repo:
+            logger.warning("RAG log repository not initialized - skipping logging")
+        else:
+            # Generate session_id if not provided (fallback for logging)
+            if not session_id:
+                import uuid
+                session_id = f"auto-{uuid.uuid4().hex[:12]}"
+                logger.info(f"Generated session_id for logging: {session_id}")
+            
+            try:
+                logger.info(f"Logging RAG query (stream): session_id={session_id}, patient_id={patient_id}, latency={latency:.2f}s")
+                chunks_for_log = self._format_chunks_for_logging(chunks)
+                await self._log_repo.log_rag_query(
+                    session_id=session_id,
+                    patient_id=patient_id,
+                    user_query=question,
+                    response=full_response,
+                    chunks_extracted=chunks_for_log,
+                    latency=latency,
+                )
+                logger.info(f"Successfully logged RAG query (stream) for session {session_id}")
+            except Exception as e:
+                # Don't fail the request if logging fails
+                logger.error(f"Failed to log RAG query (stream): {str(e)}", exc_info=True)
+
     async def _create_embedding(self, text: str) -> list[float]:
         """Create embeddings using OpenAI (OpenRouter doesn't support embeddings)."""
         try:
@@ -523,9 +894,53 @@ class RagService:
             # Skip chunks without text
             if not chunk.text or not chunk.text.strip():
                 continue
-            prefix = f"Document {chunk.document_id}"
+            # Use file_name if available, otherwise fall back to document_id
+            if chunk.file_name:
+                # Clean up the file name (remove path, extension if needed)
+                doc_name = chunk.file_name
+                # Remove common file extensions for cleaner display
+                if doc_name.endswith(('.pdf', '.txt', '.doc', '.docx')):
+                    doc_name = doc_name.rsplit('.', 1)[0]
+                prefix = f"Document: {doc_name}"
+            else:
+                prefix = f"Document: {chunk.document_id}"
             if chunk.page_number is not None:
-                prefix += f" page {chunk.page_number}"
+                prefix += f" (page {chunk.page_number})"
             formatted.append(f"{prefix}:\n{chunk.text}")
         return "\n\n".join(formatted) if formatted else "No patient context available."
+
+    @staticmethod
+    def _format_chunks_for_logging(chunks: Iterable[PatientChunk]) -> str:
+        """
+        Format chunks for logging with "----" separator between chunks.
+        This format is stored in the database for easy parsing.
+        """
+        formatted_chunks = []
+        for chunk in chunks:
+            if not chunk.text or not chunk.text.strip():
+                continue
+            
+            # Build chunk metadata
+            chunk_info = []
+            if chunk.file_name:
+                doc_name = chunk.file_name
+                if doc_name.endswith(('.pdf', '.txt', '.doc', '.docx')):
+                    doc_name = doc_name.rsplit('.', 1)[0]
+                chunk_info.append(f"Document: {doc_name}")
+            else:
+                chunk_info.append(f"Document ID: {chunk.document_id}")
+            
+            if chunk.page_number is not None:
+                chunk_info.append(f"Page: {chunk.page_number}")
+            if chunk.chunk_index is not None:
+                chunk_info.append(f"Chunk Index: {chunk.chunk_index}")
+            if chunk.similarity is not None:
+                chunk_info.append(f"Similarity: {chunk.similarity:.4f}")
+            
+            # Format: metadata + text, separated by "----" between chunks
+            chunk_str = "\n".join(chunk_info) + "\n" + chunk.text
+            formatted_chunks.append(chunk_str)
+        
+        # Join chunks with "----" separator
+        return "\n----\n".join(formatted_chunks) if formatted_chunks else "No chunks retrieved"
 

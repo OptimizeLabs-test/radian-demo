@@ -3,6 +3,7 @@ API routes consumed by the React frontend.
 """
 
 import json
+import logging
 import os
 import tempfile
 from typing import AsyncIterator, Literal
@@ -30,14 +31,49 @@ def get_rag_service(request: Request) -> RagService:
     return request.app.state.rag_service  # type: ignore[attr-defined]
 
 
+def normalize_patient_id(patient_id: str) -> str:
+    """
+    Normalize patient ID to consistent format.
+    Converts "P1-Sanjeev-Malhotra" -> "Sanjeev" for backward compatibility.
+    """
+    if patient_id.startswith("P") and "-" in patient_id:
+        # Extract first name from format "P1-Sanjeev-Malhotra" or "P1-Sanjeev"
+        parts = patient_id.split("-")
+        if len(parts) >= 2:
+            return parts[1]  # Get "Sanjeev" from "P1-Sanjeev-Malhotra"
+    return patient_id
+
+
 @router.get("/{patient_id}/summary", response_model=PatientSummary)
 async def get_summary(patient_id: str, rag: RagService = Depends(get_rag_service)) -> PatientSummary:
+    patient_id = normalize_patient_id(patient_id)
     system_context = SystemContext(
         context_mode="summary",
         patient_scope="locked",
         reference_time=datetime.now(timezone.utc).isoformat()
     )
     return await rag.generate_patient_summary(patient_id, system_context)
+
+
+@router.get("/{patient_id}/summary/stream")
+async def get_summary_stream(
+    patient_id: str,
+    rag: RagService = Depends(get_rag_service),
+) -> StreamingResponse:
+    """Stream patient summary as it's generated."""
+    patient_id = normalize_patient_id(patient_id)
+    system_context = SystemContext(
+        context_mode="summary",
+        patient_scope="locked",
+        reference_time=datetime.now(timezone.utc).isoformat()
+    )
+
+    async def event_generator() -> AsyncIterator[str]:
+        async for chunk in rag.generate_patient_summary_stream(patient_id, system_context):
+            yield f"data: {json.dumps({'content': chunk})}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @router.get("/{patient_id}/specialties", response_model=list[SpecialtyPerspective])
@@ -54,6 +90,7 @@ async def get_specialties(
 
 @router.get("/{patient_id}/intro-message", response_model=IntroMessageResponse)
 async def get_intro_message(patient_id: str, rag: RagService = Depends(get_rag_service)) -> IntroMessageResponse:
+    patient_id = normalize_patient_id(patient_id)
     message = await rag.generate_intro_message(patient_id)
     return IntroMessageResponse(message=message)
 
@@ -62,6 +99,18 @@ async def get_intro_message(patient_id: str, rag: RagService = Depends(get_rag_s
 async def post_chat(patient_id: str, payload: ChatRequest, rag: RagService = Depends(get_rag_service)) -> ChatResponse:
     """Handle chat questions with error handling."""
     try:
+        # Normalize patient ID to ensure consistent format
+        patient_id = normalize_patient_id(patient_id)
+        
+        # Log the incoming search query
+        logger = logging.getLogger(__name__)
+        logger.info(f"[RAG Query] Patient ID: {patient_id}, Question: {payload.question}")
+        # print(f"\n{'='*80}")
+        # print(f"[RAG QUERY RECEIVED]")
+        # print(f"Patient ID: {patient_id}")
+        # print(f"Search Query: {payload.question}")
+        # print(f"{'='*80}\n")
+        
         # Generate system context if not provided (hidden from frontend)
         if payload.systemContext is None:
             system_context = SystemContext(
@@ -72,16 +121,19 @@ async def post_chat(patient_id: str, payload: ChatRequest, rag: RagService = Dep
         else:
             system_context = payload.systemContext
         
+        # Log sessionId for debugging
+        logger.info(f"Processing chat request - sessionId: {payload.sessionId}, patientId: {patient_id}")
+        
         answer = await rag.answer_question(
             patient_id, 
             payload.question, 
             payload.conversationHistory,
-            system_context
+            system_context,
+            session_id=payload.sessionId,
         )
         return ChatResponse(message=answer)
     except Exception as e:
         # Log the error for debugging
-        import logging
         logger = logging.getLogger(__name__)
         logger.error(f"Error processing chat request for patient {patient_id}: {str(e)}", exc_info=True)
         
@@ -99,7 +151,14 @@ async def post_chat_stream(
     payload: ChatRequest,
     rag: RagService = Depends(get_rag_service),
 ) -> StreamingResponse:
-    """Simple SSE wrapper that chunks the final answer."""
+    """Stream chat response using OpenAI streaming API."""
+    
+    # Normalize patient ID to ensure consistent format
+    patient_id = normalize_patient_id(patient_id)
+    
+    # Log the incoming search query
+    logger = logging.getLogger(__name__)
+    logger.info(f"[RAG Query Stream] Patient ID: {patient_id}, Question: {payload.question}")
     
     # Generate system context if not provided
     if payload.systemContext is None:
@@ -112,17 +171,14 @@ async def post_chat_stream(
         system_context = payload.systemContext
 
     async def event_generator() -> AsyncIterator[str]:
-        answer = await rag.answer_question(
+        async for chunk in rag.answer_question_stream(
             patient_id, 
             payload.question, 
             payload.conversationHistory,
-            system_context
-        )
-        for sentence in answer.split(". "):
-            chunk = sentence.strip()
-            if not chunk:
-                continue
-            yield f"data: {json.dumps({'content': chunk + '. '})}\n\n"
+            system_context,
+            session_id=payload.sessionId,
+        ):
+            yield f"data: {json.dumps({'content': chunk})}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
@@ -135,12 +191,35 @@ async def post_transcribe_audio(
     rag: RagService = Depends(get_rag_service),
 ) -> ChatResponse:
     """Transcribe audio file using Whisper and return the transcription."""
+    # Normalize patient ID to ensure consistent format
+    patient_id = normalize_patient_id(patient_id)
+    
     temp_file_path = None
     try:
+        # Validate file was uploaded
+        if not audio_file.filename:
+            from app.core.errors import APIException
+            raise APIException(
+                message="No audio file provided. Please upload an audio file.",
+                details={}
+            )
+        
+        # Read file content
+        content = await audio_file.read()
+        if not content or len(content) == 0:
+            from app.core.errors import APIException
+            raise APIException(
+                message="Audio file is empty. Please try recording again.",
+                details={}
+            )
+        
+        # Get file extension from original filename, or default to .webm
+        file_ext = os.path.splitext(audio_file.filename)[1] if audio_file.filename else ".webm"
+        if not file_ext:
+            file_ext = ".webm"
+        
         # Create a temporary file to save the uploaded audio
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as temp_file:
-            # Save uploaded file to temporary location
-            content = await audio_file.read()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as temp_file:
             temp_file.write(content)
             temp_file_path = temp_file.name
         
@@ -165,7 +244,6 @@ async def post_transcribe_audio(
         return ChatResponse(message=transcription)
     except Exception as e:
         # Log the error
-        import logging
         logger = logging.getLogger(__name__)
         logger.error(f"Error transcribing audio for patient {patient_id}: {str(e)}", exc_info=True)
         

@@ -174,3 +174,58 @@ export async function sendChatQuestion(
     throw error;
   }
 }
+
+/**
+ * Transcribe Audio File
+ * 
+ * Endpoint: POST /api/patients/{id}/transcribe
+ * 
+ * Request: multipart/form-data with audio file
+ * 
+ * Uses OpenAI Whisper API to transcribe audio to text.
+ */
+export async function transcribeAudio(
+  patientId: string,
+  audioFile: File
+): Promise<string> {
+  if (API_CONFIG.useMock) {
+    // Return mock transcription after a delay
+    return new Promise((resolve) => {
+      setTimeout(() => {
+        resolve("This is a mock transcription of the audio.");
+      }, 1000);
+    });
+  }
+  
+  const formData = new FormData();
+  formData.append('audio_file', audioFile);
+  
+  try {
+    const url = `${API_CONFIG.baseUrl}/patients/${patientId}/transcribe`;
+    console.log('Transcribing audio to:', url);
+    
+    const response = await fetch(
+      url,
+      {
+        method: 'POST',
+        body: formData,
+        signal: AbortSignal.timeout(API_CONFIG.timeout * 2), // Longer timeout for audio processing
+      }
+    );
+    const data = await handleResponse<ChatResponse>(response);
+    return data.message;
+  } catch (error) {
+    console.error('Transcription error:', error);
+    // Provide more helpful error messages
+    if (error instanceof TypeError && error.message.includes('fetch')) {
+      throw new Error(
+        `Failed to connect to server at ${API_CONFIG.baseUrl}. ` +
+        `Please check if the backend is running.`
+      );
+    }
+    if (error instanceof Error && error.message.includes('timeout')) {
+      throw new Error('Transcription request timed out. Please try again.');
+    }
+    throw error;
+  }
+}

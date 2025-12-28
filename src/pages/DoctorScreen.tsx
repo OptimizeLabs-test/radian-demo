@@ -23,14 +23,15 @@ import {
   type PatientSummary,
   type ChatMessage,
 } from "@/lib/api";
+import { streamSummary, streamChatResponse } from "@/lib/api/streaming";
 
 export default function DoctorScreen() {
   const { patientId } = useParams<{ patientId: string }>();
   const navigate = useNavigate();
   const { toast } = useToast();
 
-  // Extract patient name from ID
-  const patientName = patientId?.replace(/^P\d+-/, "").replace(/-/g, " ") || "Unknown Patient";
+  // Patient ID is now just the first name (e.g., "Sanjeev")
+  const patientName = patientId || "Unknown Patient";
 
   // Data states
   const [summary, setSummary] = useState<PatientSummary | null>(null);
@@ -44,6 +45,10 @@ export default function DoctorScreen() {
   // Error states
   const [summaryError, setSummaryError] = useState<string | null>(null);
 
+  // Streaming states
+  const [streamedSummaryText, setStreamedSummaryText] = useState("");
+  const [isStreamingSummary, setIsStreamingSummary] = useState(false);
+
   useEffect(() => {
     if (!patientId) return;
 
@@ -56,23 +61,79 @@ export default function DoctorScreen() {
     const loadPatientData = async () => {
       setIsLoadingSummary(true);
       setSummaryError(null);
+      setStreamedSummaryText("");
+      setIsStreamingSummary(true);
 
       try {
-        // Fetch summary first
-        const summaryData = await fetchSummary(patientId);
-        setSummary(summaryData);
+        // Stream summary
+        let fullText = "";
+        let headline = "";
+        const bullets: string[] = [];
         
-        // Old approach: Set intro message immediately (commented out)
-        // setIntroMessage("Hello, Doctor. What would you like to know today?");
-        
-        // Old approach: Parallel API calls (commented out)
-        // const [summaryData, introMsg] = await Promise.all([
-        //   fetchSummary(patientId),
-        //   fetchIntroMessage(patientId),
-        // ]);
-        // setSummary(summaryData);
-        // setIntroMessage(introMsg);
+        await streamSummary(
+          patientId,
+          (chunk) => {
+            fullText += chunk;
+            setStreamedSummaryText(fullText);
+            
+            // Parse headline as it streams
+            const headlineMatch = fullText.match(/HEADLINE:\s*(.+?)(?:\n|BULLETS:)/i);
+            if (headlineMatch) {
+              headline = headlineMatch[1].trim();
+              if (!headline.startsWith("Overall Status:")) {
+                headline = `Overall Status: ${headline}`;
+              }
+            }
+          },
+          () => {
+            setIsStreamingSummary(false);
+            
+            // Parse final bullets from full text
+            const bulletsMatch = fullText.match(/BULLETS:\s*(.+)/is);
+            if (bulletsMatch) {
+              const bulletsText = bulletsMatch[1];
+              const lines = bulletsText.split('\n');
+              for (const line of lines) {
+                const trimmed = line.trim();
+                if (trimmed.match(/^[-•*]\s+/)) {
+                  const bulletText = trimmed.replace(/^[-•*]\s+/, "").trim();
+                  if (bulletText) {
+                    bullets.push(bulletText);
+                  }
+                }
+              }
+            }
+            
+            // Finalize summary
+            if (headline || bullets.length > 0) {
+              setSummary({
+                headline: headline || "Overall Status: Clinical Update",
+                content: bullets.length > 0 ? bullets : [fullText.trim()]
+              });
+            } else {
+              // Fallback: use full text
+              setSummary({
+                headline: "Overall Status: Clinical Update",
+                content: [fullText.trim() || "Summary unavailable"]
+              });
+            }
+            setStreamedSummaryText("");
+          },
+          (error) => {
+            setIsStreamingSummary(false);
+            setStreamedSummaryText("");
+            const errorMsg = error.message || "Failed to load patient data";
+            setSummaryError(errorMsg);
+            toast({
+              title: "Error loading patient data",
+              description: errorMsg,
+              variant: "destructive",
+            });
+          }
+        );
       } catch (error) {
+        setIsStreamingSummary(false);
+        setStreamedSummaryText("");
         const errorMsg = error instanceof Error ? error.message : "Failed to load patient data";
         setSummaryError(errorMsg);
         toast({
@@ -99,22 +160,62 @@ export default function DoctorScreen() {
     setIsLoadingChat(true);
 
     try {
-      let response: string;
-      
       if (predefinedAnswer) {
         // Use the predefined answer instead of calling API
-        response = predefinedAnswer;
+        const assistantMessage: ChatMessage = { role: "assistant", content: predefinedAnswer };
+        setMessages(prev => [...prev, assistantMessage]);
+        setIsLoadingChat(false);
       } else {
-        response = await sendChatQuestion(
+        // Stream chat response - real-time streaming as chunks arrive
+        let streamedContent = "";
+        const messageAddedRef = { current: false };
+        
+        await streamChatResponse(
           patientId,
           message,
-          [...messages, userMessage]
+          [...messages, userMessage],
+          (chunk) => {
+            streamedContent += chunk;
+            
+            // Add message on first chunk (when we have content to show)
+            if (!messageAddedRef.current && streamedContent.trim()) {
+              messageAddedRef.current = true;
+              setMessages(prev => [...prev, { role: "assistant", content: streamedContent }]);
+            } else if (messageAddedRef.current) {
+              // Update the last message with new content as chunks arrive (real-time)
+              setMessages(prev => {
+                const updated = [...prev];
+                updated[updated.length - 1] = { role: "assistant", content: streamedContent };
+                return updated;
+              });
+            }
+          },
+          () => {
+            setIsLoadingChat(false);
+          },
+          (error) => {
+            setIsLoadingChat(false);
+            const errorMsg = error.message || "Failed to send message";
+            console.error('Error sending message:', error);
+            toast({
+              title: "Error",
+              description: errorMsg,
+              variant: "destructive",
+            });
+            // Remove user message and assistant message (if it was added) if the request failed
+            setMessages(prev => {
+              const newMessages = [...prev];
+              newMessages.pop(); // Remove user message
+              if (messageAddedRef.current) {
+                newMessages.pop(); // Remove assistant message if it was added
+              }
+              return newMessages;
+            });
+          }
         );
       }
-
-      const assistantMessage: ChatMessage = { role: "assistant", content: response };
-      setMessages(prev => [...prev, assistantMessage]);
     } catch (error) {
+      setIsLoadingChat(false);
       const errorMsg = error instanceof Error ? error.message : "Failed to send message";
       console.error('Error sending message:', error);
       toast({
@@ -124,8 +225,6 @@ export default function DoctorScreen() {
       });
       // Remove the user message if the request failed
       setMessages(prev => prev.slice(0, -1));
-    } finally {
-      setIsLoadingChat(false);
     }
   };
 
@@ -176,11 +275,13 @@ export default function DoctorScreen() {
           isLoading={isLoadingSummary}
           error={summaryError}
         /> */}
-        {!isLoadingSummary && (summary || summaryError) && (
+        {(summary || streamedSummaryText || summaryError || isLoadingSummary) && (
           <SnapshotPanel
             summary={summary}
-            isLoading={false}
+            isLoading={isLoadingSummary}
             error={summaryError}
+            streamedContent={streamedSummaryText}
+            isStreaming={isStreamingSummary}
           />
         )}
 
@@ -192,8 +293,9 @@ export default function DoctorScreen() {
           messages={messages}
           isLoading={isLoadingChat}
         /> */}
-        {!isLoadingSummary && introMessage && (
+        {!isLoadingSummary && introMessage && patientId && (
           <ConversationalAgent
+            patientId={patientId}
             introMessage={introMessage}
             onSendMessage={handleSendMessage}
             messages={messages}

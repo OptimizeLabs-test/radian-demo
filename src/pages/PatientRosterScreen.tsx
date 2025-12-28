@@ -15,10 +15,10 @@ interface Patient {
 }
 
 const patients: Patient[] = [
-  { id: "P1-Sanjeev-Malhotra", name: "Sanjeev Malhotra", filesUploaded: 12, available: true },
-  { id: "P2-Priya-Sharma", name: "Priya Sharma", filesUploaded: 8, available: false },
-  { id: "P3-Amit-Patel", name: "Amit Patel", filesUploaded: 15, available: false },
-  { id: "P4-Lakshmi-Nair", name: "Lakshmi Nair", filesUploaded: 6, available: false },
+  { id: "Sanjeev", name: "Sanjeev Malhotra", filesUploaded: 12, available: true },
+  { id: "Priya", name: "Priya Sharma", filesUploaded: 8, available: false },
+  { id: "Amit", name: "Amit Patel", filesUploaded: 15, available: false },
+  { id: "Lakshmi", name: "Lakshmi Nair", filesUploaded: 6, available: false },
 ];
 
 export default function PatientRosterScreen() {

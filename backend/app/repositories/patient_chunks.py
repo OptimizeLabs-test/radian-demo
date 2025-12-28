@@ -43,33 +43,8 @@ class PatientChunkRepository:
     async def close(self) -> None:
         await self._pool.close()
 
-    @staticmethod
-    def _normalize_patient_id(patient_id: str) -> str:
-        """
-        Map frontend patient ID format to backend format.
-        
-        Frontend format: 'P1-Sanjeev-Malhotra' or 'P[X]-FirstName-LastName'
-        Backend format: 'Sanjeev' or 'FirstName'
-        
-        Args:
-            patient_id: Patient ID from frontend (e.g., 'P1-Sanjeev-Malhotra')
-            
-        Returns:
-            Normalized patient ID for database query (e.g., 'Sanjeev')
-        """
-        # Pattern: P followed by digits, then dash, then first name, then dash, then last name
-        # Example: P1-Sanjeev-Malhotra -> Sanjeev
-        pattern = r'^P\d+-(.+?)-.+$'
-        match = re.match(pattern, patient_id)
-        if match:
-            return match.group(1)  # Return the first name (first group after P\d+-)
-        # If pattern doesn't match, assume it's already in the correct format
-        return patient_id
-
     async def fetch_recent_chunks(self, patient_id: str, limit: int) -> list[PatientChunk]:
         """Return the most recent deterministic set of chunks for summarization."""
-        # Normalize patient ID from frontend format to backend format
-        normalized_id = self._normalize_patient_id(patient_id)
         
         query = """
         SELECT chunk_id, document_id, patient_id, file_name, page_number, chunk_index, text
@@ -78,7 +53,57 @@ class PatientChunkRepository:
         ORDER BY ingested_at DESC, page_number NULLS LAST, chunk_index NULLS LAST
         LIMIT $2
         """
-        rows = await self._fetch(query, normalized_id, limit)
+        rows = await self._fetch(query, patient_id, limit)
+        return [PatientChunk(**row) for row in rows]
+
+    async def search_chunks_by_keyword(
+        self,
+        patient_id: str,
+        keyword: str,
+        limit: int,
+    ) -> list[PatientChunk]:
+        """
+        Search chunks by keyword in text content (case-insensitive).
+        Useful for finding all chunks containing a specific lab name or term.
+        """
+        query = """
+        SELECT chunk_id, document_id, patient_id, file_name, page_number, chunk_index, text
+        FROM patient_chunks
+        WHERE patient_id = $1
+          AND text ILIKE $2
+        ORDER BY ingested_at DESC, page_number NULLS LAST, chunk_index NULLS LAST
+        LIMIT $3
+        """
+        # Use %keyword% for partial matching
+        search_term = f"%{keyword}%"
+        rows = await self._fetch(query, patient_id, search_term, limit)
+        return [PatientChunk(**row) for row in rows]
+
+    async def fetch_chunks_by_documents(
+        self,
+        patient_id: str,
+        document_ids: list[str],
+        limit_per_document: int = 5,
+    ) -> list[PatientChunk]:
+        """
+        Fetch chunks from specific documents. Useful for retrieving related chunks
+        from the same documents that contain the keyword.
+        """
+        if not document_ids:
+            return []
+        
+        # Use ANY to match any document_id in the list
+        query = """
+        SELECT chunk_id, document_id, patient_id, file_name, page_number, chunk_index, text
+        FROM patient_chunks
+        WHERE patient_id = $1
+          AND document_id = ANY($2::text[])
+        ORDER BY document_id, page_number NULLS LAST, chunk_index NULLS LAST
+        LIMIT $3
+        """
+        # Limit total chunks retrieved
+        total_limit = len(document_ids) * limit_per_document
+        rows = await self._fetch(query, patient_id, document_ids, total_limit)
         return [PatientChunk(**row) for row in rows]
 
     async def search_similar_chunks(
@@ -96,9 +121,6 @@ class PatientChunkRepository:
         Uses the match_patient_chunks stored function which leverages the IVFFLAT index
         for faster searches. The ivfflat_probes parameter controls the accuracy/speed tradeoff.
         """
-        # Normalize patient ID from frontend format to backend format
-        normalized_id = self._normalize_patient_id(patient_id)
-        
         # Convert embedding list to a format that pgvector understands
         embedding_list = list(embedding) if not isinstance(embedding, list) else embedding
         
@@ -121,8 +143,8 @@ class PatientChunkRepository:
                     rows = await connection.fetch(
                         "SELECT * FROM match_patient_chunks($1, $2, $3, $4)",
                         embedding_vector,
-                        normalized_id,
-                        min(limit, 10),  # Cap at 10 for speed
+                        patient_id,
+                        limit,  # Use full limit for better accuracy
                         min_similarity,
                     )
                 except (asyncpg.exceptions.UndefinedFunctionError, asyncpg.exceptions.UndefinedTableError) as e:
@@ -147,7 +169,7 @@ class PatientChunkRepository:
                     ORDER BY embedding <-> $2::vector
                     LIMIT $3
                     """
-                    rows = await connection.fetch(query, normalized_id, embedding_vector, limit)
+                    rows = await connection.fetch(query, patient_id, embedding_vector, limit)
                     # Filter by similarity threshold manually
                     rows = [r for r in rows if r["similarity"] and r["similarity"] >= min_similarity]
             except Exception as e:
@@ -167,7 +189,7 @@ class PatientChunkRepository:
                 ORDER BY embedding <-> $2::vector
                 LIMIT $3
                 """
-                rows = await connection.fetch(query, normalized_id, embedding_vector, limit)
+                rows = await connection.fetch(query, patient_id, embedding_vector, limit)
                 # Filter by similarity threshold manually
                 rows = [r for r in rows if r["similarity"] and r["similarity"] >= min_similarity]
         

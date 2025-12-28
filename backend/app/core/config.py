@@ -23,9 +23,8 @@ class Settings(BaseSettings):
 
     # OpenAI / OpenRouter
     openai_api_key: str = Field(..., alias="OPENAI_API_KEY")
-    # openai_model: str = "gpt-4o-mini"  # Fixed: was "gpt-4.1" which doesn't exist
+    # openai_model: str = "gpt-4o-mini" 
     openai_model: str = "google/gemini-3-flash-preview"
-    # openai_model: str = "google/gemini-3-flash-preview"
     openai_embedding_model: str = "text-embedding-3-large"
     openai_timeout_seconds: int = 60  # Increased for RAG operations
     
@@ -35,10 +34,11 @@ class Settings(BaseSettings):
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
 
     # Retrieval
-    max_retrieval_chunks: int = 25  # Reduced from 12 for faster retrieval
-    min_similarity_score: float = 0.3  # Lowered from 0.3 for better matching
-    min_similarity_score_chat: float = 0.3  # Lowered for faster retrieval
-    ivfflat_probes: int = 1  # Reduced from 10 to 1 for maximum speed (accuracy tradeoff acceptable)
+    max_retrieval_chunks_chat: int = 15  # Maximum chunks to retrieve for chat queries (for accuracy)
+    max_retrieval_chunks_summary: int = 8  # Maximum chunks to retrieve for summaries (for speed)
+    min_similarity_score: float = 0.3  # Minimum similarity threshold for matching
+    min_similarity_score_chat: float = 0.25  # Lower threshold for chat to capture more relevant chunks
+    ivfflat_probes: int = 10  # Increased from 1 to 10 for better search accuracy (speed vs accuracy tradeoff)
 
     # Specialty agents
     specialty_agents: List[str] = ["Cardiology", "Endocrinology", "Nephrology"]

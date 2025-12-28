@@ -13,7 +13,6 @@ class PatientSummary(BaseModel):
         ..., description="Array of paragraphs highlighting trends and observations"
     )
 
-
 class SpecialtyPerspective(BaseModel):
     specialty: str
     insights: list[str]
@@ -35,6 +34,7 @@ class ChatRequest(BaseModel):
     question: str = Field(..., min_length=4, max_length=2000)
     conversationHistory: list[ChatMessage] = Field(default_factory=list)
     systemContext: SystemContext | None = Field(None, description="Hidden system context (auto-generated if not provided)")
+    sessionId: str | None = Field(None, description="Session identifier for logging and tracking")
 
 
 class ChatResponse(BaseModel):
