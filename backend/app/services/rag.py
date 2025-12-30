@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
 import time
 from textwrap import dedent
@@ -222,6 +223,128 @@ class RagService:
             r'\blist\s+',  # "list all"
         ]
         return any(re.search(pattern, question_lower) for pattern in patterns)
+    
+    def _calculate_keyword_score(self, chunk: PatientChunk, question: str) -> float:
+        """
+        Calculate keyword matching score between chunk text and question.
+        Returns a score between 0 and 1.
+        """
+        if not chunk.text:
+            return 0.0
+        
+        question_lower = question.lower()
+        chunk_text_lower = chunk.text.lower()
+        
+        # Extract keywords from question (remove common stop words)
+        stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'what', 'when', 'where', 'how', 
+        'is', 'are', 'was', 'were', 'be', 'been', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should'}
+        
+        question_words = [w for w in re.findall(r'\b\w+\b', question_lower) if w not in stop_words and len(w) > 2]
+        
+        if not question_words:
+            return 0.0
+        
+        # Count matches
+        matches = sum(1 for word in question_words if word in chunk_text_lower)
+        
+        # Calculate score: proportion of question keywords found, with bonus for multiple occurrences
+        base_score = matches / len(question_words)
+        
+        # Bonus for multiple occurrences of keywords
+        total_occurrences = sum(chunk_text_lower.count(word) for word in question_words)
+        occurrence_bonus = min(0.3, (total_occurrences - matches) * 0.1)
+        
+        return min(1.0, base_score + occurrence_bonus)
+    
+    def _calculate_recency_score(self, chunks: list[PatientChunk], chunk: PatientChunk) -> float:
+        """
+        Calculate recency score based on position in the list.
+        Assumes chunks are ordered by recency (most recent first).
+        Returns a score between 0 and 1.
+        """
+        try:
+            index = chunks.index(chunk)
+            # Normalize: most recent chunk gets 1.0, least recent gets close to 0
+            # Use exponential decay for better differentiation
+            max_index = len(chunks) - 1
+            if max_index == 0:
+                return 1.0
+            # Exponential decay: score = e^(-index / max_index * 2)
+            # This gives more weight to recent chunks
+            score = math.exp(-index / max_index * 2)
+            return max(0.1, score)  # Ensure minimum score of 0.1
+        except ValueError:
+            return 0.5  # Default score if chunk not found
+    
+    def _rerank_chunks(
+        self, 
+        chunks: list[PatientChunk], 
+        question: str,
+        top_k: int
+    ) -> list[PatientChunk]:
+        """
+        Re-rank chunks using a hybrid scoring approach.
+        
+        Combines:
+        - Semantic similarity (from vector search)
+        - Keyword matching score
+        - Recency score
+        
+        Returns top-K chunks after re-ranking.
+        """
+        if not chunks or not self._settings.rerank_enabled:
+            return chunks[:top_k] if chunks else []
+        
+        # If we have fewer chunks than top_k, return all
+        if len(chunks) <= top_k:
+            return chunks
+        
+        # Calculate composite scores for each chunk
+        scored_chunks = []
+        for chunk in chunks:
+            # Normalize similarity score (assume it's already between 0 and 1)
+            similarity_score = chunk.similarity if chunk.similarity is not None else 0.0
+            similarity_score = max(0.0, min(1.0, similarity_score))  # Clamp to [0, 1]
+            
+            # Calculate keyword score
+            keyword_score = self._calculate_keyword_score(chunk, question)
+            
+            # Calculate recency score (based on original position)
+            recency_score = self._calculate_recency_score(chunks, chunk)
+            
+            # If chunk has no similarity score (from keyword search), boost keyword weight
+            # and use keyword score as a proxy for similarity
+            if chunk.similarity is None:
+                # For chunks without similarity, rely more on keyword matching
+                # Use keyword score as a proxy for semantic relevance
+                adjusted_similarity = keyword_score * 0.8  # Scale keyword score to approximate similarity
+                composite_score = (
+                    self._settings.rerank_similarity_weight * adjusted_similarity +
+                    self._settings.rerank_keyword_weight * keyword_score +
+                    self._settings.rerank_recency_weight * recency_score
+                )
+            else:
+                # Standard weighted composite score for chunks with similarity
+                composite_score = (
+                    self._settings.rerank_similarity_weight * similarity_score +
+                    self._settings.rerank_keyword_weight * keyword_score +
+                    self._settings.rerank_recency_weight * recency_score
+                )
+            
+            scored_chunks.append((composite_score, chunk))
+        
+        # Sort by composite score (descending) and return top-K
+        scored_chunks.sort(key=lambda x: x[0], reverse=True)
+        reranked_chunks = [chunk for _, chunk in scored_chunks[:top_k]]
+        
+        # Log re-ranking results for debugging
+        logger = logging.getLogger(__name__)
+        logger.debug(
+            f"Re-ranked {len(chunks)} chunks to top {len(reranked_chunks)}. "
+            f"Top 3 scores: {[f'{score:.3f}' for score, _ in scored_chunks[:3]]}"
+        )
+        
+        return reranked_chunks
 
     async def answer_question(
         self, 
@@ -238,14 +361,21 @@ class RagService:
         # Use configurable chunk limit for chat queries
         chunk_limit = self._settings.max_retrieval_chunks_chat
         
+        # Determine retrieval limit: use top-N for re-ranking if enabled, otherwise use final limit
+        retrieval_limit = (
+            self._settings.rerank_top_n 
+            if self._settings.rerank_enabled 
+            else chunk_limit
+        )
+        
         # Create embedding and search in parallel if possible, but embedding is required first
         embedding = await self._create_embedding(question)
         
-        # Start with semantic search
+        # Start with semantic search - retrieve top-N chunks for re-ranking
         chunks = await self._repo.search_similar_chunks(
             patient_id,
             embedding,
-            chunk_limit,
+            retrieval_limit,  # Retrieve more chunks for re-ranking
             min_similarity=self._settings.min_similarity_score_chat,  # Use chat-specific threshold
             ivfflat_probes=self._settings.ivfflat_probes,
         )
@@ -287,11 +417,15 @@ class RagService:
                             chunk_ids_seen.add(chunk.chunk_id)
                 
                 # Limit total chunks to avoid context overflow (but allow more for comprehensive queries)
-                if len(chunks) > chunk_limit * 3:
-                    chunks = chunks[:chunk_limit * 3]
+                if len(chunks) > retrieval_limit * 2:
+                    chunks = chunks[:retrieval_limit * 2]
         
         if not chunks:
-            chunks = await self._repo.fetch_recent_chunks(patient_id, chunk_limit)
+            chunks = await self._repo.fetch_recent_chunks(patient_id, retrieval_limit)
+        
+        # Apply re-ranking if enabled
+        if self._settings.rerank_enabled and chunks:
+            chunks = self._rerank_chunks(chunks, question, top_k=chunk_limit)
         
         # Print retrieved chunks to console
         # print("\n" + "="*80)
@@ -774,14 +908,21 @@ class RagService:
         # Use configurable chunk limit for chat queries
         chunk_limit = self._settings.max_retrieval_chunks_chat
         
+        # Determine retrieval limit: use top-N for re-ranking if enabled, otherwise use final limit
+        retrieval_limit = (
+            self._settings.rerank_top_n 
+            if self._settings.rerank_enabled 
+            else chunk_limit
+        )
+        
         # Create embedding and search
         embedding = await self._create_embedding(question)
         
-        # Start with semantic search
+        # Start with semantic search - retrieve top-N chunks for re-ranking
         chunks = await self._repo.search_similar_chunks(
             patient_id,
             embedding,
-            chunk_limit,
+            retrieval_limit,  # Retrieve more chunks for re-ranking
             min_similarity=self._settings.min_similarity_score_chat,
             ivfflat_probes=self._settings.ivfflat_probes,
         )
@@ -816,11 +957,15 @@ class RagService:
                             chunks.append(chunk)
                             chunk_ids_seen.add(chunk.chunk_id)
                 
-                if len(chunks) > chunk_limit * 3:
-                    chunks = chunks[:chunk_limit * 3]
+                if len(chunks) > retrieval_limit * 2:
+                    chunks = chunks[:retrieval_limit * 2]
         
         if not chunks:
-            chunks = await self._repo.fetch_recent_chunks(patient_id, chunk_limit)
+            chunks = await self._repo.fetch_recent_chunks(patient_id, retrieval_limit)
+        
+        # Apply re-ranking if enabled
+        if self._settings.rerank_enabled and chunks:
+            chunks = self._rerank_chunks(chunks, question, top_k=chunk_limit)
         
         context = self._format_chunks(chunks)
         
