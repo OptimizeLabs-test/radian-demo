@@ -54,10 +54,17 @@ class Settings(BaseSettings):
     # CORS
     cors_origins: List[AnyHttpUrl] = Field(
         default_factory=lambda: [
-            AnyHttpUrl("http://localhost:8080"),
-            AnyHttpUrl("http://127.0.0.1:8080"),
+            AnyHttpUrl("http://localhost:8080"),  # Vite dev server (configured in vite.config.ts)
+            AnyHttpUrl("http://127.0.0.1:8080"),  # Same as above, using IP address
         ]
     )
+    # Set CORS_ALLOW_ALL_ORIGINS=true to allow all origins (NOT RECOMMENDED for production)
+    # Default is False for security - only allow specific origins
+    cors_allow_all_origins: bool = Field(default=False, alias="CORS_ALLOW_ALL_ORIGINS")
+    
+    # Additional allowed origins from environment variable (comma-separated)
+    # Example: CORS_ADDITIONAL_ORIGINS=https://app.vercel.app,https://custom-domain.com
+    cors_additional_origins: str | None = Field(default=None, alias="CORS_ADDITIONAL_ORIGINS")
 
     # Observability
     log_level: str = "INFO"

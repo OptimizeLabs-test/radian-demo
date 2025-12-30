@@ -10,11 +10,14 @@ export const API_CONFIG = {
    * Base URL for the Python backend API
    * 
    * Development: http://localhost:8000/api
-   * Production: https://your-domain.com/api
+   * Production: /api (relative path when backend is on same domain)
    * 
    * Set via environment variable VITE_API_BASE_URL
+   * If not set, uses relative path in production, localhost in development
    */
-  baseUrl: import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api',
+  baseUrl: import.meta.env.VITE_API_BASE_URL || (
+    import.meta.env.PROD ? '/api' : 'http://localhost:8000/api'
+  ),
 
   /**
    * Request timeout in milliseconds
