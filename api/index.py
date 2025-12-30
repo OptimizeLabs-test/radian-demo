@@ -4,7 +4,6 @@ This file routes all /api/* requests to the FastAPI application.
 """
 
 import sys
-import os
 from pathlib import Path
 
 # Add the backend directory to the Python path
@@ -21,4 +20,7 @@ from mangum import Mangum
 # Note: lifespan="off" because serverless functions don't support startup/shutdown events
 # The middleware in app.main will handle lazy initialization
 handler = Mangum(app, lifespan="off")
+
+# Vercel expects the handler to be exported
+# This is the entry point for all /api/* requests
 
