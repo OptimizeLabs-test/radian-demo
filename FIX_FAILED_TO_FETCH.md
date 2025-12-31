@@ -251,3 +251,4 @@ console.log('Mock mode:', import.meta.env.VITE_USE_MOCK_API);
 - ✅ Mock mode is off
 - ✅ Patient data loads successfully
 
+

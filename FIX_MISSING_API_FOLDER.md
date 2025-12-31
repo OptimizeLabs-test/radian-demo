@@ -177,3 +177,4 @@ Once `api/index.py` is deployed:
    - Check browser console for errors
    - Verify environment variables are set
 
+

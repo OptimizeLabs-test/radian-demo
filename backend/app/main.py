@@ -69,6 +69,43 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
 
+# Configure CORS FIRST (before other middleware) based on settings
+if settings.cors_allow_all_origins:
+    # When allowing all origins, cannot use credentials (CORS spec limitation)
+    cors_origins = ["*"]
+    cors_credentials = False
+else:
+    cors_origins = [str(origin) for origin in settings.cors_origins]
+    # Add additional origins from environment variable
+    if settings.cors_additional_origins:
+        additional = [origin.strip() for origin in settings.cors_additional_origins.split(",")]
+        cors_origins.extend(additional)
+    # Add common development ports for localhost
+    if settings.environment == "local":
+        common_dev_origins = [
+            "http://localhost:5173",  # Vite default
+            "http://127.0.0.1:5173",
+            "http://localhost:3000",  # React default
+            "http://127.0.0.1:3000",
+            "http://localhost:5174",  # Vite alternate
+            "http://127.0.0.1:5174",
+            "http://localhost:8080",  # Already in default, but ensure it's there
+            "http://127.0.0.1:8080",
+        ]
+        for origin in common_dev_origins:
+            if origin not in cors_origins:
+                cors_origins.append(origin)
+    cors_credentials = True
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=cors_credentials,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["*"],  # Allow all headers for CORS preflight requests
+    expose_headers=["*"],  # Expose all headers in responses
+)
+
 # Middleware to ensure state is initialized (for serverless)
 @app.middleware("http")
 async def ensure_initialized(request: Request, call_next):
@@ -79,24 +116,6 @@ async def ensure_initialized(request: Request, call_next):
         request.app.state.log_repo = _app_state["log_repo"]
         request.app.state.rag_service = _app_state["rag_service"]
     return await call_next(request)
-
-# Configure CORS based on settings
-if settings.cors_allow_all_origins:
-    cors_origins = ["*"]
-else:
-    cors_origins = [str(origin) for origin in settings.cors_origins]
-    # Add additional origins from environment variable
-    if settings.cors_additional_origins:
-        additional = [origin.strip() for origin in settings.cors_additional_origins.split(",")]
-        cors_origins.extend(additional)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=cors_origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],  # Restrict methods
-    allow_headers=["Content-Type", "Authorization", "X-API-Key"],  # Restrict headers
-)
 
 app.include_router(patient_router, prefix=settings.api_prefix)
 

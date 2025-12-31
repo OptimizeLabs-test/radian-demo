@@ -1,9 +1,8 @@
-# Vercel serverless function dependencies
-# This file is used by Vercel to install Python packages
+# Python dependencies for TARA backend
+# This file is used by Railway and other deployment platforms
 
 # FastAPI and ASGI server
 fastapi>=0.115.0
-mangum>=0.17.0
 uvicorn[standard]>=0.32.0
 
 # HTTP client
