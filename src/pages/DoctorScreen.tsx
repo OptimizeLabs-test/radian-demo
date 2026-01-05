@@ -24,6 +24,7 @@ import {
   type ChatMessage,
 } from "@/lib/api";
 import { streamSummary, streamChatResponse } from "@/lib/api/streaming";
+import { parseSummaryBullets } from "@/utils/summaryParser";
 
 export default function DoctorScreen() {
   const { patientId } = useParams<{ patientId: string }>();
@@ -88,35 +89,31 @@ export default function DoctorScreen() {
           () => {
             setIsStreamingSummary(false);
             
-            // Parse final bullets from full text
+            // Use utility function to parse final summary
+            const { headline: parsedHeadline, bullets: parsedBullets } = parseSummaryBullets(fullText);
+            
+            // Check for any trailing text after the last bullet marker as incomplete bullet
             const bulletsMatch = fullText.match(/BULLETS:\s*(.+)/is);
             if (bulletsMatch) {
-              const bulletsText = bulletsMatch[1];
-              const lines = bulletsText.split('\n');
-              for (const line of lines) {
-                const trimmed = line.trim();
-                if (trimmed.match(/^[-•*]\s+/)) {
-                  const bulletText = trimmed.replace(/^[-•*]\s+/, "").trim();
-                  if (bulletText) {
-                    bullets.push(bulletText);
+              const afterBullets = bulletsMatch[1];
+              const lines = afterBullets.split('\n').map(l => l.trim()).filter(Boolean);
+              if (lines.length > 0) {
+                const lastLine = lines[lines.length - 1];
+                // If last line doesn't start with bullet marker but has content, add it
+                if (!lastLine.match(/^[-•*]\s+/) && lastLine.length > 0) {
+                  const alreadyIncluded = parsedBullets.some(b => b.includes(lastLine) || lastLine.includes(b));
+                  if (!alreadyIncluded) {
+                    parsedBullets.push(lastLine);
                   }
                 }
               }
             }
             
             // Finalize summary
-            if (headline || bullets.length > 0) {
-              setSummary({
-                headline: headline || "Overall Status: Clinical Update",
-                content: bullets.length > 0 ? bullets : [fullText.trim()]
-              });
-            } else {
-              // Fallback: use full text
-              setSummary({
-                headline: "Overall Status: Clinical Update",
-                content: [fullText.trim() || "Summary unavailable"]
-              });
-            }
+            setSummary({
+              headline: parsedHeadline || headline || "Overall Status: Clinical Update",
+              content: parsedBullets.length > 0 ? parsedBullets : [fullText.trim() || "Summary unavailable"]
+            });
             setStreamedSummaryText("");
           },
           (error) => {

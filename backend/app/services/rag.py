@@ -4,13 +4,12 @@ Retrieval augmented generation service using OpenAI + Supabase.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import math
 import re
 import time
 from textwrap import dedent
-from typing import AsyncIterator, Iterable, Literal
+from typing import AsyncIterator, Iterable, Literal, Optional
 from datetime import datetime
 
 from openai import AsyncOpenAI
@@ -36,9 +35,10 @@ SYSTEM_PROMPT = dedent(
     - Read through ALL provided document chunks thoroughly and completely
     - Extract ALL numerical values, dates, lab results, measurements, and test values from the context
     - Values may appear in various formats: tables, lists, paragraphs, or structured data
-    - When searching for specific dates, be flexible with date formats (e.g., "Nov 21, 2025", "2025-11-21", "November 21, 2025", "11/21/2025")
+    - When searching for specific dates, be flexible with date formats (e.g., "Nov 21, 2025", "2025-11-21", "November 21, 2025", "11/21/2025", "Sep 25", "September 25")
     - Do NOT state that data is missing until you have carefully examined every chunk for the requested information
     - Report ALL matching values found, not just the first one encountered
+    - For queries asking for "last N results", find ALL matching values across all chunks and sort them by date
     
     Strict constraints:
     - Do NOT make diagnoses, differential diagnoses, or treatment recommendations
@@ -58,6 +58,14 @@ SYSTEM_PROMPT = dedent(
     3. Clinical notes
     4. Patient-reported information
     
+    Response Formatting (adapt to physician's request):
+    - Match the format the physician asks for (e.g., if they ask for bullet points, use bullets; if they ask for a table, use a markdown table)
+    - For multiple lab values with dates, consider using a markdown table for clarity
+    - Use **bold** to emphasize critical values or out-of-range findings
+    - Always include units with numerical values (e.g., "52 mg/dL" not just "52")
+    - Use bullet points for lists of observations or trends
+    - Use numbered lists only for sequential or chronological information
+    
     Use clear, clinician-facing language.
     Be concise, factual, and neutral.
     """
@@ -66,18 +74,24 @@ SYSTEM_PROMPT = dedent(
 SUMMARY_PROMPT = dedent(
     """
     You are Radian. Generate a concise, up-to-date patient summary for physician review.
- 
+
     This summary must reflect the available data across the patient record.
-    If multiple data points exist, prioritize the latest dated entry for each category.
+    
+    CRITICAL - DATA RECENCY:
+    - For each data type (labs, vitals, medications), find the MOST RECENT value by ACTUAL DATE
+    - Sort all values by their test/measurement date, NOT by when they appear in the document
+    - If you see "HbA1c on Nov 21, 2025" and "HbA1c on Sep 25, 2025", use November as most recent
+    - Search ALL provided chunks thoroughly - recent values may appear anywhere in the context
+    - Explicitly state the date for the most recent value of each metric
     
     Format STRICTLY as follows:
     
     HEADLINE:
-    Overall Status: <1-line neutral summary of current state based on available data>
+    Overall Status: <1-line neutral summary of current state based on most recent data>
     
     KEY POINTS:
-    - <Vital sign trends with values and timeframes>
-    - <Relevant lab trends with values, dates, and direction of change>
+    - <Vital sign trends with **bold values** and specific dates of most recent readings>
+    - <Lab trends with **bold values**, dates, and direction of change - prioritize by recency>
     - <Medication adherence or continuity status>
     - <Notable recent changes or stability compared to prior data>
     - <Items that require monitoring or follow-up review>
@@ -85,12 +99,15 @@ SUMMARY_PROMPT = dedent(
     Rules:
     - Use bullet points only (no paragraphs)
     - Each bullet must be one concise line
+    - Use **bold markdown** for all numerical values and test names (e.g., **HbA1c 6.2%**)
     - Include specific values, dates, and trends when available
+    - Always show the MOST RECENT date for each metric mentioned
     - Do NOT include diagnoses, interpretations, or treatment suggestions
     - Do NOT speculate beyond documented data
     
     If recent data is missing:
     - Explicitly note the absence (e.g., "No lab results recorded in the last 3 months")
+    - State the date of the last available value if older than 3 months
     """
 ).strip()
 
@@ -148,9 +165,36 @@ class RagService:
         patient_id: str, 
         system_context: SystemContext
     ) -> PatientSummary:
+        """
+        Generate a patient summary using hybrid retrieval:
+        1. Fetch recent chunks by ingestion time (gets latest documents)
+        2. Also search for key medical terms to ensure we don't miss recent lab values
+        3. Combine and deduplicate
+        """
         # Use configurable chunk limit for summaries
         chunk_limit = self._settings.max_retrieval_chunks_summary
-        chunks = await self._repo.fetch_recent_chunks(patient_id, chunk_limit)
+        
+        # Get recent chunks by ingestion time
+        recent_chunks = await self._repo.fetch_recent_chunks(patient_id, chunk_limit)
+        
+        # Also search for critical lab terms to ensure we capture recent values
+        # (e.g., if November HbA1c is in an older document, we still want it)
+        critical_terms = ["hba1c", "glucose", "blood pressure", "cholesterol", "creatinine"]
+        keyword_chunks = []
+        for term in critical_terms:
+            term_chunks = await self._repo.search_chunks_by_keyword(patient_id, term, limit=3)
+            keyword_chunks.extend(term_chunks)
+        
+        # Combine and deduplicate by chunk_id
+        chunk_ids_seen = {chunk.chunk_id for chunk in recent_chunks}
+        for chunk in keyword_chunks:
+            if chunk.chunk_id not in chunk_ids_seen:
+                recent_chunks.append(chunk)
+                chunk_ids_seen.add(chunk.chunk_id)
+        
+        # Limit to reasonable size
+        chunks = recent_chunks[:chunk_limit * 2]  # Allow some extra for hybrid search
+        
         context = self._format_chunks(chunks)
         
         # Enhance prompt with reference_time
@@ -184,6 +228,9 @@ class RagService:
             r'\bcholesterol\b',
             r'\bglucose\b',
             r'\bhba1c\b',
+            r'\bhpa1c\b',  # Common misspelling/variant
+            r'\ba1c\b',  # Shorthand for HbA1c
+            r'\bhemoglobin a1c\b',
             r'\bcreatinine\b',
             r'\bhemoglobin\b',
             r'\bplatelet[s]?\b',
@@ -197,6 +244,11 @@ class RagService:
             r'\bbmi\b',
             r'\bweight\b',
             r'\bheight\b',
+            r'\bbun\b',  # Blood Urea Nitrogen
+            r'\begfr\b',  # Estimated Glomerular Filtration Rate
+            r'\bpotassium\b',
+            r'\bsodium\b',
+            r'\bcalcium\b',
         ]
         
         for pattern in lab_patterns:
@@ -358,15 +410,27 @@ class RagService:
         # Start timing for latency measurement
         start_time = time.perf_counter()
         
-        # Use configurable chunk limit for chat queries
-        chunk_limit = self._settings.max_retrieval_chunks_chat
+        question_lower = question.lower()
         
-        # Determine retrieval limit: use top-N for re-ranking if enabled, otherwise use final limit
-        retrieval_limit = (
-            self._settings.rerank_top_n 
-            if self._settings.rerank_enabled 
-            else chunk_limit
-        )
+        # Extract "last N" pattern once and reuse throughout
+        last_n_match = re.search(r'last\s+(\d+)', question_lower)
+        last_n_count = int(last_n_match.group(1)) if last_n_match else None
+        
+        # Detect if query asks for comprehensive/exhaustive results
+        asks_for_all = any(term in question_lower for term in ['all', 'every', 'complete', 'full'])
+        needs_comprehensive_retrieval = last_n_count is not None  # Any "last N" query needs comprehensive retrieval
+        
+        # Adjust chunk limits dynamically based on query intent
+        if asks_for_all or needs_comprehensive_retrieval:
+            # Comprehensive query: retrieve more chunks
+            chunk_limit = 25  # Increased from default for exhaustive searches
+            retrieval_limit = 100 if self._settings.rerank_enabled else chunk_limit
+            min_sim = 0.15  # Lower threshold
+        else:
+            # Normal query: use standard limits
+            chunk_limit = self._settings.max_retrieval_chunks_chat
+            retrieval_limit = self._settings.rerank_top_n if self._settings.rerank_enabled else chunk_limit
+            min_sim = self._settings.min_similarity_score_chat
         
         # Create embedding and search in parallel if possible, but embedding is required first
         embedding = await self._create_embedding(question)
@@ -376,7 +440,7 @@ class RagService:
             patient_id,
             embedding,
             retrieval_limit,  # Retrieve more chunks for re-ranking
-            min_similarity=self._settings.min_similarity_score_chat,  # Use chat-specific threshold
+            min_similarity=min_sim,  # Use dynamic threshold based on query type
             ivfflat_probes=self._settings.ivfflat_probes,
         )
         
@@ -450,7 +514,7 @@ class RagService:
         context = self._format_chunks(chunks)
         
         # Enhance chat prompt with temporal context and formatting instructions
-        chat_prompt = self._get_chat_prompt(question)
+        chat_prompt = self._get_chat_prompt(question, last_n_match, last_n_count)
         enhanced_prompt = self._add_temporal_context(chat_prompt, system_context)
         
         message = await self._chat_completion(
@@ -493,7 +557,12 @@ class RagService:
         
         return message
 
-    def _get_chat_prompt(self, question: str) -> str:
+    def _get_chat_prompt(
+        self, 
+        question: str,
+        last_n_match: Optional[re.Match] = None,
+        last_n_count: Optional[int] = None
+    ) -> str:
         """Generate appropriate chat prompt based on question type."""
         question_lower = question.lower()
         
@@ -608,7 +677,17 @@ class RagService:
         #     Provide factual, concise answers based on the medical records.
         #     """
         # ).strip()
-        return dedent(
+        # Detect explicit format requests
+        asks_for_table = 'table' in question_lower or 'tabular' in question_lower
+        asks_for_bullets = 'bullet' in question_lower or 'list' in question_lower
+        asks_for_sentence = 'brief' in question_lower or 'sentence' in question_lower or 'summary' in question_lower
+        
+        # Detect multi-value queries (multiple lab values, histories, trends)
+        is_multi_value_query = bool(re.search(r'\blast\s+\d+', question_lower)) or \
+                               any(term in question_lower for term in ['all', 'history', 'trend', 'over time', 'multiple', 'several'])
+        
+        # Build base prompt
+        base_prompt = dedent(
             """
             Answer the physician's question using the patient context provided.
             
@@ -633,6 +712,77 @@ class RagService:
             Be concise, factual, and neutral.
             """
         ).strip()
+        
+        # Add smart formatting hint based on query intent
+        formatting_hint = ""
+        
+        if asks_for_table:
+            # Explicit request for table
+            formatting_hint = "\n\nFORMAT: Use a markdown table as requested."
+        elif asks_for_bullets:
+            # Explicit request for bullets
+            formatting_hint = "\n\nFORMAT: Use bullet points as requested."
+        elif asks_for_sentence:
+            # Explicit request for brief/sentence format
+            formatting_hint = "\n\nFORMAT: Provide a concise response in sentence form as requested."
+        elif is_multi_value_query and any(term in question_lower for term in [
+            'lab', 'lipid', 'cholesterol', 'glucose', 'hemoglobin', 'creatinine',
+            'triglyceride', 'hdl', 'ldl', 'vitals', 'blood pressure', 'results',
+            'hba1c', 'hpa1c', 'a1c', 'hemoglobin a1c',  # Diabetes monitoring
+            'bun', 'egfr', 'potassium', 'sodium', 'calcium'  # Electrolytes/kidney
+        ]):
+            # Multiple lab values - suggest table for clarity, but don't force it
+            formatting_hint = dedent("""
+                
+                FORMATTING SUGGESTION: If you find multiple lab values with dates, consider presenting them in a markdown table format for clarity:
+                | Test | Value | Date | Reference Range |
+                
+                However, use your judgment based on the number of values and what would be clearest for the physician.
+            """).strip()
+        
+        # Add exhaustive search instruction ONLY for "all/every/complete/full" queries
+        # Do NOT add for "last N" queries as they have their own specific instructions below
+        if any(term in question_lower for term in ['all', 'every', 'complete', 'full']) and not last_n_match:
+            formatting_hint += dedent("""
+                
+                CRITICAL - EXHAUSTIVE SEARCH MODE:
+                The physician is requesting a comprehensive list. You MUST:
+                - Review EVERY SINGLE chunk provided, even if it seems less relevant
+                - Extract ALL matching values, dates, and results from ALL chunks
+                - Do NOT stop after finding a few results - continue searching ALL chunks
+                - Report the TOTAL count of results found
+                - If you find fewer than expected, explicitly state "searched N chunks, found M results"
+            """).strip()
+        
+        # Add specific instruction for "last N" queries (using already-extracted match from parameter)
+        if last_n_match and last_n_count:
+            formatting_hint += dedent(f"""
+                
+                CRITICAL - "LAST {last_n_count}" QUERY INSTRUCTIONS:
+                The physician is asking for the {last_n_count} MOST RECENT results sorted by date.
+                
+                MANDATORY PROCESS:
+                1. Extract ALL matching results from ALL provided chunks (ignore semantic relevance)
+                2. Create a list of (date, value) pairs for EVERY result found
+                3. Sort this ENTIRE list by date in DESCENDING order (newest first)
+                4. Take ONLY the first {last_n_count} items from the sorted list
+                5. Present these {last_n_count} results with the most recent at the top
+                
+                EXAMPLE for "last 3 glucose readings":
+                - Found: Jan 15 (120), Dec 10 (115), Nov 5 (110), Oct 1 (105), Sep 20 (100)
+                - Sorted: Jan 15, Dec 10, Nov 5, Oct 1, Sep 20
+                - Return: ONLY Jan 15 (120), Dec 10 (115), Nov 5 (110)  [First 3 after sorting]
+                
+                VERIFICATION BEFORE RESPONDING:
+                - Count how many results you extracted total (e.g., "Found 15 total results")
+                - If found < {last_n_count}, state: "Found only X results (requested {last_n_count})"
+                - If found >= {last_n_count}, confirm: "Sorted all results and selected top {last_n_count}"
+                - Check the date range of your final {last_n_count} results
+                
+                CRITICAL: Do NOT return more than {last_n_count} results, even if you found more!
+            """).strip()
+        
+        return base_prompt + formatting_hint
 
     def _add_temporal_context(self, prompt: str, system_context: SystemContext) -> str:
         """Add temporal anchoring instructions to prompt."""
@@ -756,7 +906,7 @@ class RagService:
         # Determine max_tokens based on whether this is a chat response (needs more tokens for formatting)
         # or summary (can be shorter)
         is_chat_response = question is not None or history is not None
-        max_tokens = 1500 if is_chat_response else 400  # Increased from 800 to 1500 for more detailed chat responses
+        max_tokens = 1000 if is_chat_response else 400  # Changed from 1500 to 1000 - Phase 1 speed optimization
         
         try:
             completion = await self._client.chat.completions.create(
@@ -826,7 +976,7 @@ class RagService:
         # Determine max_tokens based on whether this is a chat response (needs more tokens for formatting)
         # or summary (can be shorter)
         is_chat_response = question is not None or history is not None
-        max_tokens = 1500 if is_chat_response else 400
+        max_tokens = 1000 if is_chat_response else 400  # Changed from 1500 to 1000 - Phase 1 speed optimization
         
         try:
             stream = await self._client.chat.completions.create(
@@ -866,10 +1016,30 @@ class RagService:
         patient_id: str, 
         system_context: SystemContext
     ) -> AsyncIterator[str]:
-        """Stream patient summary as it's generated."""
+        """Stream patient summary as it's generated with hybrid retrieval."""
         # Use configurable chunk limit for summaries
         chunk_limit = self._settings.max_retrieval_chunks_summary
-        chunks = await self._repo.fetch_recent_chunks(patient_id, chunk_limit)
+        
+        # Get recent chunks by ingestion time
+        recent_chunks = await self._repo.fetch_recent_chunks(patient_id, chunk_limit)
+        
+        # Also search for critical lab terms to ensure we capture recent values
+        critical_terms = ["hba1c", "glucose", "blood pressure", "cholesterol", "creatinine"]
+        keyword_chunks = []
+        for term in critical_terms:
+            term_chunks = await self._repo.search_chunks_by_keyword(patient_id, term, limit=3)
+            keyword_chunks.extend(term_chunks)
+        
+        # Combine and deduplicate by chunk_id
+        chunk_ids_seen = {chunk.chunk_id for chunk in recent_chunks}
+        for chunk in keyword_chunks:
+            if chunk.chunk_id not in chunk_ids_seen:
+                recent_chunks.append(chunk)
+                chunk_ids_seen.add(chunk.chunk_id)
+        
+        # Limit to reasonable size
+        chunks = recent_chunks[:chunk_limit * 2]
+        
         context = self._format_chunks(chunks)
         
         # Enhance prompt with reference_time
@@ -905,15 +1075,27 @@ class RagService:
         # Start timing for latency measurement
         start_time = time.perf_counter()
         
-        # Use configurable chunk limit for chat queries
-        chunk_limit = self._settings.max_retrieval_chunks_chat
+        question_lower = question.lower()
         
-        # Determine retrieval limit: use top-N for re-ranking if enabled, otherwise use final limit
-        retrieval_limit = (
-            self._settings.rerank_top_n 
-            if self._settings.rerank_enabled 
-            else chunk_limit
-        )
+        # Extract "last N" pattern once and reuse throughout
+        last_n_match = re.search(r'last\s+(\d+)', question_lower)
+        last_n_count = int(last_n_match.group(1)) if last_n_match else None
+        
+        # Detect if query asks for comprehensive/exhaustive results
+        asks_for_all = any(term in question_lower for term in ['all', 'every', 'complete', 'full'])
+        needs_comprehensive_retrieval = last_n_count is not None  # Any "last N" query needs comprehensive retrieval
+        
+        # Adjust chunk limits dynamically based on query intent
+        if asks_for_all or needs_comprehensive_retrieval:
+            # Comprehensive query: retrieve more chunks
+            chunk_limit = 25  # Increased from default for exhaustive searches
+            retrieval_limit = 100 if self._settings.rerank_enabled else chunk_limit
+            min_sim = 0.15  # Lower threshold
+        else:
+            # Normal query: use standard limits
+            chunk_limit = self._settings.max_retrieval_chunks_chat
+            retrieval_limit = self._settings.rerank_top_n if self._settings.rerank_enabled else chunk_limit
+            min_sim = self._settings.min_similarity_score_chat
         
         # Create embedding and search
         embedding = await self._create_embedding(question)
@@ -923,7 +1105,7 @@ class RagService:
             patient_id,
             embedding,
             retrieval_limit,  # Retrieve more chunks for re-ranking
-            min_similarity=self._settings.min_similarity_score_chat,
+            min_similarity=min_sim,  # Use dynamic threshold based on query type
             ivfflat_probes=self._settings.ivfflat_probes,
         )
         
@@ -970,7 +1152,7 @@ class RagService:
         context = self._format_chunks(chunks)
         
         # Enhance chat prompt with temporal context and formatting instructions
-        chat_prompt = self._get_chat_prompt(question)
+        chat_prompt = self._get_chat_prompt(question, last_n_match, last_n_count)
         enhanced_prompt = self._add_temporal_context(chat_prompt, system_context)
         
         # Stream the response and collect it for logging

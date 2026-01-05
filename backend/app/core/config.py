@@ -34,16 +34,16 @@ class Settings(BaseSettings):
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
 
     # Retrieval
-    max_retrieval_chunks_chat: int = 15  # Maximum chunks to retrieve for chat queries (for accuracy)
+    max_retrieval_chunks_chat: int = 20  # Increased from 15 - better coverage for multi-value queries
     max_retrieval_chunks_summary: int = 8  # Maximum chunks to retrieve for summaries (for speed)
     min_similarity_score: float = 0.3  # Minimum similarity threshold for matching
-    min_similarity_score_chat: float = 0.25  # Lower threshold for chat to capture more relevant chunks
-    ivfflat_probes: int = 10  # Increased from 1 to 10 for better search accuracy (speed vs accuracy tradeoff)
+    min_similarity_score_chat: float = 0.20  # Changed from 0.25 - lower threshold for better recall
+    ivfflat_probes: int = 3  # Changed from 10 to 3 - speed optimization (Phase 1)
     
     # Re-ranking (top-n, top-k strategy)
     rerank_enabled: bool = True  # Enable re-ranking
-    rerank_top_n: int = 50  # Retrieve top-N chunks before re-ranking (should be > max_retrieval_chunks_chat)
-    rerank_top_k: int = 15  # Keep top-K chunks after re-ranking (typically equals max_retrieval_chunks_chat)
+    rerank_top_n: int = 75  # Increased from 50 - retrieve more before re-ranking
+    rerank_top_k: int = 20  # Increased from 15 - matches max_retrieval_chunks_chat
     rerank_similarity_weight: float = 0.6  # Weight for semantic similarity in re-ranking score (increased from 0.5)
     rerank_keyword_weight: float = 0.25  # Weight for keyword matching in re-ranking score (decreased from 0.3)
     rerank_recency_weight: float = 0.15  # Weight for recency in re-ranking score (decreased from 0.2)

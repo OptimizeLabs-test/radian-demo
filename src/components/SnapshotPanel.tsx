@@ -4,7 +4,10 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { FileText } from "lucide-react";
 import { useStreamingText } from "@/hooks/useStreamingText";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import type { PatientSummary } from "@/lib/api";
+import { parseStreamingSummary } from "@/utils/summaryParser";
 
 interface SnapshotPanelProps {
   summary: PatientSummary | null;
@@ -17,11 +20,13 @@ interface SnapshotPanelProps {
 function StreamingBulletPoint({
   text,
   index,
-  isActive
+  isActive,
+  onComplete
 }: {
   text: string;
   index: number;
   isActive: boolean;
+  onComplete?: () => void;
 }) {
   // All bullets stream with slow character-by-character animation
   const {
@@ -33,10 +38,17 @@ function StreamingBulletPoint({
     mode: "character", // Stream character-by-character
   });
   
+  // Notify parent when streaming completes
+  useEffect(() => {
+    if (!isStreaming && onComplete) {
+      onComplete();
+    }
+  }, [isStreaming, onComplete]);
+  
   return <li className="flex items-start gap-2">
       <span className="text-primary mt-0.5">•</span>
-      <span className="text-sm text-muted-foreground leading-relaxed">
-        {displayedText}
+      <span className="text-sm text-muted-foreground leading-relaxed prose prose-sm max-w-none prose-p:m-0 prose-strong:text-foreground prose-strong:font-semibold">
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>{displayedText}</ReactMarkdown>
         {isStreaming && <span className="inline-block w-1 h-3 bg-muted-foreground/50 ml-0.5 animate-pulse" />}
       </span>
     </li>;
@@ -50,95 +62,35 @@ export function SnapshotPanel({
   isStreaming
 }: SnapshotPanelProps) {
   const [streamedText, setStreamedText] = useState("");
-  const [completedBullets, setCompletedBullets] = useState<string[]>([]);
-  const [currentBullet, setCurrentBullet] = useState("");
   const [streamedHeadlineText, setStreamedHeadlineText] = useState("");
+  const [parsedBullets, setParsedBullets] = useState<string[]>([]);
+  const [currentBullet, setCurrentBullet] = useState("");
+  const [visibleCount, setVisibleCount] = useState(0);
 
-  // Handle streaming content - parse bullets sequentially
+  // Handle streaming content - parse bullets for sequential display
   useEffect(() => {
     if (streamedContent !== undefined && streamedContent) {
       setStreamedText(streamedContent);
       
-      // Parse headline
-      const headlineMatch = streamedContent.match(/HEADLINE:\s*(.+?)(?:\n|BULLETS:)/is);
-      if (headlineMatch) {
-        let headline = headlineMatch[1].trim();
-        if (!headline.startsWith("Overall Status:")) {
-          headline = `Overall Status: ${headline}`;
-        }
-        setStreamedHeadlineText(headline);
-      }
+      const { headline, parsedBullets: bullets, currentBullet: current } = parseStreamingSummary(streamedContent);
       
-      // Extract bullets section
-      const bulletsMatch = streamedContent.match(/BULLETS:\s*(.+)/is);
-      if (bulletsMatch) {
-        const bulletsText = bulletsMatch[1];
-        const lines = bulletsText.split('\n');
-        const parsedBullets: string[] = [];
-        let currentBulletLines: string[] = [];
-        
-        for (let i = 0; i < lines.length; i++) {
-          const line = lines[i];
-          const trimmedLine = line.trim();
-          
-          // Check if this line starts a new bullet (starts with "-", "•", or number)
-          const isNewBullet = trimmedLine.match(/^[-•*]\s+/) || 
-                             (trimmedLine.match(/^\d+\.\s+/) && currentBulletLines.length === 0);
-          
-          if (isNewBullet) {
-            // If we had a current bullet, it's now complete
-            if (currentBulletLines.length > 0) {
-              const completedBullet = currentBulletLines.join(" ").trim();
-              if (completedBullet) {
-                parsedBullets.push(completedBullet);
-              }
-              currentBulletLines = [];
-            }
-            // Start new bullet (remove bullet marker)
-            const bulletText = trimmedLine.replace(/^[-•*]\s+/, "").replace(/^\d+\.\s+/, "").trim();
-            if (bulletText) {
-              currentBulletLines.push(bulletText);
-            }
-          } else if (trimmedLine && currentBulletLines.length > 0) {
-            // Continue current bullet (multi-line bullet)
-            currentBulletLines.push(trimmedLine);
-          } else if (trimmedLine && currentBulletLines.length === 0) {
-            // Text without bullet marker at start - treat as new bullet
-            currentBulletLines.push(trimmedLine);
-          }
-        }
-        
-        // Update completed bullets and current bullet
-        setCompletedBullets(parsedBullets);
-        const currentBulletText = currentBulletLines.join(" ").trim();
-        setCurrentBullet(currentBulletText);
-      } else {
-        // Fallback: try to parse bullets without BULLETS: marker
-        const lines = streamedContent.split('\n');
-        const potentialBullets: string[] = [];
-        let foundHeadline = false;
-        
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (trimmed.toUpperCase().startsWith('HEADLINE:')) {
-            foundHeadline = true;
-            continue;
-          }
-          if (foundHeadline && (trimmed.startsWith('-') || trimmed.startsWith('•'))) {
-            const bulletText = trimmed.replace(/^[-•*]\s+/, "").trim();
-            if (bulletText) {
-              potentialBullets.push(bulletText);
-            }
-          }
-        }
-        
-        if (potentialBullets.length > 0) {
-          setCompletedBullets(potentialBullets.slice(0, -1));
-          setCurrentBullet(potentialBullets[potentialBullets.length - 1] || "");
-        }
+      setStreamedHeadlineText(headline);
+      setParsedBullets(bullets);
+      setCurrentBullet(current);
+      
+      // Reset visible count when new bullets arrive
+      if (bullets.length > visibleCount) {
+        // Don't reset, just let it grow naturally
       }
     }
   }, [streamedContent]);
+  
+  // Start showing first bullet when parsing begins
+  useEffect(() => {
+    if (parsedBullets.length > 0 && visibleCount === 0) {
+      setVisibleCount(1);
+    }
+  }, [parsedBullets.length, visibleCount]);
 
   // Use streamed headline if available, otherwise use summary headline
   const headlineToDisplay = streamedHeadlineText || summary?.headline || null;
@@ -153,13 +105,31 @@ export function SnapshotPanel({
   });
 
   // Determine which bullets to display
-  // If streaming, show completed bullets + current bullet
-  // Otherwise, show summary bullets
-  const displayBullets = (streamedText && (completedBullets.length > 0 || currentBullet))
-    ? [...completedBullets, ...(currentBullet ? [currentBullet] : [])]
-    : (summary?.content || []);
+  // Sequential streaming: show only visible bullets + current bullet if still streaming
+  let displayBullets: string[];
+  if (streamedText && parsedBullets.length > 0) {
+    // Show completed bullets up to visibleCount
+    const visibleCompleted = parsedBullets.slice(0, visibleCount);
+    // Add current bullet if we're still streaming and have shown all completed ones
+    if (currentBullet && visibleCount >= parsedBullets.length) {
+      displayBullets = [...visibleCompleted, currentBullet];
+    } else {
+      displayBullets = visibleCompleted;
+    }
+  } else {
+    // Use summary bullets if not streaming
+    displayBullets = summary?.content || [];
+  }
   
   const displayHeadline = streamedHeadlineText || streamedHeadline || summary?.headline;
+  
+  // Callback when a bullet finishes streaming
+  const handleBulletComplete = () => {
+    // Show next bullet when current one completes
+    if (visibleCount < parsedBullets.length) {
+      setTimeout(() => setVisibleCount(prev => prev + 1), 100);
+    }
+  };
 
   return <Card className="p-5 bg-card border border-border shadow-sm h-full flex flex-col">
       <div className="flex items-center gap-2 mb-3">
@@ -196,6 +166,7 @@ export function SnapshotPanel({
                         text={bullet}
                         index={idx}
                         isActive={idx === displayBullets.length - 1 && (isStreaming || !!currentBullet)}
+                        onComplete={idx === visibleCount - 1 ? handleBulletComplete : undefined}
                       />
                     ))}
                   </ul>
