@@ -1,5 +1,5 @@
 # Python dependencies for TARA backend
-# Python dependencies for backend deployment
+# This file is used by Railway and other deployment platforms
 
 # FastAPI and ASGI server
 fastapi>=0.115.0
