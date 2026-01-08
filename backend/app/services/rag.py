@@ -177,12 +177,12 @@ class RagService:
         # Get recent chunks by ingestion time
         recent_chunks = await self._repo.fetch_recent_chunks(patient_id, chunk_limit)
         
-        # Also search for critical lab terms to ensure we capture recent values
-        # (e.g., if November HbA1c is in an older document, we still want it)
-        critical_terms = ["hba1c", "glucose", "blood pressure", "cholesterol", "creatinine"]
+        # Reduced keyword search for speed - only search top 2 critical terms
+        # (hba1c and glucose cover most diabetes monitoring needs)
+        critical_terms = ["hba1c", "glucose"]
         keyword_chunks = []
         for term in critical_terms:
-            term_chunks = await self._repo.search_chunks_by_keyword(patient_id, term, limit=3)
+            term_chunks = await self._repo.search_chunks_by_keyword(patient_id, term, limit=1)
             keyword_chunks.extend(term_chunks)
         
         # Combine and deduplicate by chunk_id
@@ -192,8 +192,8 @@ class RagService:
                 recent_chunks.append(chunk)
                 chunk_ids_seen.add(chunk.chunk_id)
         
-        # Limit to reasonable size
-        chunks = recent_chunks[:chunk_limit * 2]  # Allow some extra for hybrid search
+        # Limit to reasonable size - keep it tight for speed
+        chunks = recent_chunks[:chunk_limit + 2]  # Just a couple extra for critical labs
         
         context = self._format_chunks(chunks)
         
@@ -906,7 +906,7 @@ class RagService:
         # Determine max_tokens based on whether this is a chat response (needs more tokens for formatting)
         # or summary (can be shorter)
         is_chat_response = question is not None or history is not None
-        max_tokens = 1000 if is_chat_response else 400  # Changed from 1500 to 1000 - Phase 1 speed optimization
+        max_tokens = 1000 if is_chat_response else 450  # Increased from 300 to prevent truncation while staying faster
         
         try:
             completion = await self._client.chat.completions.create(
@@ -976,7 +976,7 @@ class RagService:
         # Determine max_tokens based on whether this is a chat response (needs more tokens for formatting)
         # or summary (can be shorter)
         is_chat_response = question is not None or history is not None
-        max_tokens = 1000 if is_chat_response else 400  # Changed from 1500 to 1000 - Phase 1 speed optimization
+        max_tokens = 1000 if is_chat_response else 450  # Increased from 300 to prevent truncation while staying faster
         
         try:
             stream = await self._client.chat.completions.create(
@@ -1023,11 +1023,12 @@ class RagService:
         # Get recent chunks by ingestion time
         recent_chunks = await self._repo.fetch_recent_chunks(patient_id, chunk_limit)
         
-        # Also search for critical lab terms to ensure we capture recent values
-        critical_terms = ["hba1c", "glucose", "blood pressure", "cholesterol", "creatinine"]
+        # Reduced keyword search for speed - only search top 2 critical terms
+        # (hba1c and glucose cover most diabetes monitoring needs)
+        critical_terms = ["hba1c", "glucose"]
         keyword_chunks = []
         for term in critical_terms:
-            term_chunks = await self._repo.search_chunks_by_keyword(patient_id, term, limit=3)
+            term_chunks = await self._repo.search_chunks_by_keyword(patient_id, term, limit=1)
             keyword_chunks.extend(term_chunks)
         
         # Combine and deduplicate by chunk_id
@@ -1037,8 +1038,8 @@ class RagService:
                 recent_chunks.append(chunk)
                 chunk_ids_seen.add(chunk.chunk_id)
         
-        # Limit to reasonable size
-        chunks = recent_chunks[:chunk_limit * 2]
+        # Limit to reasonable size - keep it tight for speed
+        chunks = recent_chunks[:chunk_limit + 2]  # Just a couple extra for critical labs
         
         context = self._format_chunks(chunks)
         

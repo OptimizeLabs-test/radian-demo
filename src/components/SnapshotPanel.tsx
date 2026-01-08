@@ -66,24 +66,35 @@ export function SnapshotPanel({
   const [parsedBullets, setParsedBullets] = useState<string[]>([]);
   const [currentBullet, setCurrentBullet] = useState("");
   const [visibleCount, setVisibleCount] = useState(0);
+  const [lastProcessedLength, setLastProcessedLength] = useState(0);
 
-  // Handle streaming content - parse bullets for sequential display
+  // Handle streaming content - parse bullets incrementally for sequential display
   useEffect(() => {
     if (streamedContent !== undefined && streamedContent) {
       setStreamedText(streamedContent);
       
-      const { headline, parsedBullets: bullets, currentBullet: current } = parseStreamingSummary(streamedContent);
-      
-      setStreamedHeadlineText(headline);
-      setParsedBullets(bullets);
-      setCurrentBullet(current);
-      
-      // Reset visible count when new bullets arrive
-      if (bullets.length > visibleCount) {
-        // Don't reset, just let it grow naturally
+      // Only re-parse if content has grown significantly to avoid constant re-renders
+      const contentGrowth = streamedContent.length - lastProcessedLength;
+      if (contentGrowth > 10 || !isStreaming) {
+        const { headline, parsedBullets: bullets, currentBullet: current } = parseStreamingSummary(streamedContent);
+        
+        setStreamedHeadlineText(headline);
+        
+        // Only update bullets if we have new complete bullets
+        if (bullets.length > parsedBullets.length) {
+          setParsedBullets(bullets);
+        }
+        
+        // Update current bullet being streamed (filter out empty lines)
+        const cleanCurrent = current.trim().replace(/\n\s*\n/g, '\n').trim();
+        if (cleanCurrent !== currentBullet) {
+          setCurrentBullet(cleanCurrent);
+        }
+        
+        setLastProcessedLength(streamedContent.length);
       }
     }
-  }, [streamedContent]);
+  }, [streamedContent, isStreaming, lastProcessedLength]);
   
   // Start showing first bullet when parsing begins
   useEffect(() => {

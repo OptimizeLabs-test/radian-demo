@@ -23,22 +23,23 @@ class Settings(BaseSettings):
 
     # OpenAI / OpenRouter
     openai_api_key: str = Field(..., alias="OPENAI_API_KEY")
-    # openai_model: str = "gpt-4o-mini" 
-    openai_model: str = "google/gemini-3-flash-preview"
+    # Switched to gpt-4o-mini for faster summary generation with OpenAI
+    openai_model: str = "gpt-4o-mini"
     openai_embedding_model: str = "text-embedding-3-large"
     openai_timeout_seconds: int = 60  # Increased for RAG operations
     
     # OpenRouter (for Gemini and other models)
     openrouter_api_key: str | None = Field(default=None, alias="OPENROUTER_API_KEY")
-    use_openrouter: bool = Field(default=True, alias="USE_OPENROUTER")  # Default to True to use OpenRouter
+    use_openrouter: bool = Field(default=False, alias="USE_OPENROUTER")  # Disabled to use OpenAI directly
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
 
     # Retrieval
     max_retrieval_chunks_chat: int = 20  # Increased from 15 - better coverage for multi-value queries
-    max_retrieval_chunks_summary: int = 8  # Maximum chunks to retrieve for summaries (for speed)
+    max_retrieval_chunks_summary: int = 5  # Reduced from 8 for faster summary generation
     min_similarity_score: float = 0.3  # Minimum similarity threshold for matching
     min_similarity_score_chat: float = 0.20  # Changed from 0.25 - lower threshold for better recall
     ivfflat_probes: int = 3  # Changed from 10 to 3 - speed optimization (Phase 1)
+    ivfflat_probes_summary: int = 1  # Even faster for summaries - sacrifice minimal accuracy for speed
     
     # Re-ranking (top-n, top-k strategy)
     rerank_enabled: bool = True  # Enable re-ranking

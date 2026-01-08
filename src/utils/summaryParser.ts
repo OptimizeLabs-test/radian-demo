@@ -70,7 +70,8 @@ export interface ParsedSummary {
     const bulletsMatch = streamedContent.match(/KEY POINTS:\s*(.+)/is);
     if (bulletsMatch) {
       const bulletsSection = bulletsMatch[1];
-      const lines = bulletsSection.split('\n');
+      // Filter out empty lines to avoid double-line rendering issues
+      const lines = bulletsSection.split('\n').filter(line => line.trim());
       let tempBulletLines: string[] = [];
   
       for (let i = 0; i < lines.length; i++) {
@@ -83,13 +84,14 @@ export interface ParsedSummary {
         if (isNewBullet) {
           // Save previous bullet if exists
           if (tempBulletLines.length > 0) {
-            parsedBullets.push(tempBulletLines.join(" ").trim());
+            // Join with single space and clean up extra whitespace
+            parsedBullets.push(tempBulletLines.join(" ").replace(/\s+/g, ' ').trim());
             tempBulletLines = [];
           }
           // Start new bullet
           tempBulletLines.push(trimmedLine.replace(/^[-•*]\s+/, "").replace(/^\d+\.\s+/, "").trim());
         } else if (trimmedLine && tempBulletLines.length > 0) {
-          // Continue current bullet (multi-line)
+          // Continue current bullet (multi-line) - add space to join naturally
           tempBulletLines.push(trimmedLine);
         } else if (trimmedLine && tempBulletLines.length === 0) {
           // Text without marker - treat as new bullet
@@ -97,8 +99,8 @@ export interface ParsedSummary {
         }
       }
       
-      // Current bullet is what's being built
-      currentBulletText = tempBulletLines.join(" ").trim();
+      // Current bullet is what's being built - clean up whitespace
+      currentBulletText = tempBulletLines.join(" ").replace(/\s+/g, ' ').trim();
     }
   
     return { headline, parsedBullets, currentBullet: currentBulletText };

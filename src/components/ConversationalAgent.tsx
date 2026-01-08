@@ -18,22 +18,6 @@ interface ConversationalAgentProps {
   isLoading: boolean;
 }
 
-// Pre-defined question-answer mapping
-const questionAnswerMap: Record<string, {
-  question: string;
-}> = {
-  "6-Month Summary": {
-    question: "Radian summarize this patient's last 6 months of medical history in 5 lines"
-  },
-  "Last 4 IFE Readings": {
-    question: "Radian Give me the patients last 4 IFE readings"
-  },
-  "30-Day Risk Score": {
-    question: "Based on this patient's last 1 year of vitals, labs, and medications, calculate their risk of decompensation in the next 30 days and show me which variables contributed most to the risk."
-  }
-};
-const quickQuestionLabels = Object.keys(questionAnswerMap);
-
 // Component to render streaming chat message
 function StreamingChatMessage({ 
   content, 
@@ -66,7 +50,6 @@ export function ConversationalAgent({
   isLoading
 }: ConversationalAgentProps) {
   const [input, setInput] = useState("");
-  const [pendingPredefinedKey, setPendingPredefinedKey] = useState<string | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -97,18 +80,9 @@ export function ConversationalAgent({
     if (!input.trim() || isLoading) return;
     const message = input;
     setInput("");
-    setPendingPredefinedKey(null);
     
     // Always call the API, no predefined answers
     await onSendMessage(message);
-  };
-  const handleQuickQuestion = (label: string) => {
-    if (isLoading) return;
-    const mapping = questionAnswerMap[label];
-    if (mapping) {
-      setInput(mapping.question);
-      setPendingPredefinedKey(label);
-    }
   };
   const handleVoiceInput = async () => {
     if (isLoading || isTranscribing) return;
@@ -287,13 +261,6 @@ export function ConversationalAgent({
             <Send className="h-3.5 w-3.5" />
           </Button>
         </form>
-
-        {/* Quick questions */}
-        <div className="flex gap-1.5 overflow-x-auto pb-0.5 -mx-1 px-1 scrollbar-hide">
-          {quickQuestionLabels.map((label, idx) => <button key={idx} onClick={() => handleQuickQuestion(label)} disabled={isLoading} className="text-[10px] px-2 py-1 rounded-full bg-teal-100 text-teal-700 hover:bg-teal-200 transition-colors disabled:opacity-50 whitespace-nowrap shrink-0">
-              {label}
-            </button>)}
-        </div>
         
         <p className="text-[10px] text-muted-foreground/60 italic text-center">
           Generated from patient-provided information. AI may make errors, please verify all critical details.               
